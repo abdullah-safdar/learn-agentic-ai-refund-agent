@@ -1,0 +1,23 @@
+# Backend (Python)
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+backend/*.egg-info/
+backend/.env
+
+# Frontend (Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# BMad planning tooling - not part of the public tutorial
+.claude/
+_bmad/
+_bmad-output/
