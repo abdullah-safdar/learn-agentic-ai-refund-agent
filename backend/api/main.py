@@ -7,10 +7,17 @@ anything to run -- this is the minimal glue, not a new architectural piece.
 
 Adapter construction (`_get_repository`/`_get_llm_port`) is lazy: merely
 importing this module (for tooling, OpenAPI generation, tests, ...) must not
-require `DATABASE_URL`/`ANTHROPIC_API_KEY` to be set or create a live
-Anthropic client as a side effect. Construction happens on first use --
+require `DATABASE_URL`/an LLM provider's API key to be set, or create a live
+provider client, as a side effect. Construction happens on first use --
 either the migrations step in `_lifespan` (when the app actually starts) or
 the first request that resolves the corresponding dependency.
+
+LLM provider selection (`LLM_PROVIDER` env var, default "groq") lives here,
+at the composition root -- not inside an adapter -- because "which adapter do
+we wire up" is a deployment/config decision, not adapter logic. Anthropic
+gets its own adapter (genuinely different wire protocol); every other
+supported provider (Groq, OpenAI, xAI/Grok) is one generic adapter
+parameterized by provider name -- see adapters/llm_extraction.py.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from typing import AsyncIterator, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from adapters.llm_extraction import build_default_llm_port
+from adapters import anthropic_extraction, llm_extraction
 from adapters.postgres_repository import PostgresRefundRepository
 from api import chat_routes
 from api.errors import register_error_handlers
@@ -45,7 +52,11 @@ def _get_repository() -> PostgresRefundRepository:
 def _get_llm_port() -> LLMPort:
     global _llm_port
     if _llm_port is None:
-        _llm_port = build_default_llm_port()
+        provider = os.environ.get("LLM_PROVIDER", "groq")
+        if provider == "anthropic":
+            _llm_port = anthropic_extraction.build_llm_port()
+        else:
+            _llm_port = llm_extraction.build_llm_port(provider)
     return _llm_port
 
 

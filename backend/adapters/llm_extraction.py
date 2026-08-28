@@ -1,12 +1,18 @@
-"""LLMPort implementation: extracts the fixed schema from chat text.
+"""LLMPort implementation for the OpenAI-compatible provider family.
 
-Ask First (spec): no LLM provider/SDK is architecturally mandated -- this
-picks Anthropic's Claude API as a reasonable default (this project's own
-tooling already targets Claude, and Anthropic's `messages.parse()` gives a
-Pydantic-validated structured output in one call). Flag for renegotiation
-if a different provider is preferred; swapping it out means writing a new
-class against `LLMPort` and rewiring `api/main.py` -- domain/intake.py never
-changes.
+Groq, OpenAI itself, and xAI/Grok all serve the same wire protocol (same
+chat-completions request/response shape, same JSON-mode convention) -- that's
+not a coincidence, they deliberately cloned OpenAI's API. Because the actual
+HTTP call is identical across all of them, one generic, parameterized adapter
+covers the whole family: switching provider is a `.env` change
+(`LLM_PROVIDER=groq` -> `openai` -> `xai`), never a new file or a code change.
+
+Anthropic is the one provider that does NOT belong here -- its SDK has a
+genuinely different request/response shape (see `anthropic_extraction.py`).
+Folding it into this file would mean branching per-provider inside one
+adapter, which defeats the point of Ports & Adapters (each adapter should be
+dumb translation, not a provider dispatcher) -- see
+docs/planning/ARCHITECTURE-EXPLAINER.md's "How to extend this safely".
 
 This adapter contains no business logic -- it only translates chat text to
 the fixed `ExtractedRefundFields` schema the domain defines. Dedup, request
@@ -18,19 +24,13 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-import anthropic
+from openai import OpenAI
 from pydantic import BaseModel
 
 from domain.ports import ExtractedRefundFields, LLMPort
 
-# Model choice per this skill's guidance: default to Claude Opus 5 unless the
-# caller overrides it (e.g. to trade accuracy for latency/cost at higher
-# volume).
-DEFAULT_MODEL = "claude-opus-5"
-
-# A hanging/slow provider response must not block a chat request handler
-# indefinitely -- bound it explicitly rather than relying on the SDK's
-# 10-minute default.
+# Mirrors the Anthropic adapter's bound -- a hanging provider response must
+# not block a chat request handler indefinitely.
 DEFAULT_TIMEOUT_SECONDS = 12.0
 
 _SYSTEM_PROMPT = (
@@ -40,47 +40,74 @@ _SYSTEM_PROMPT = (
     "that isn't present in the message. If a field isn't stated, leave it "
     "empty (empty string for order_reference/reason, null for "
     "amount_cents). Do not attempt to validate the order or decide "
-    "whether the refund is justified -- that happens elsewhere."
+    "whether the refund is justified -- that happens elsewhere.\n\n"
+    "Respond with a single JSON object, and nothing else, matching exactly "
+    "this shape:\n"
+    '{"order_reference": string, "reason": string, "amount_cents": integer or null}\n'
+    "amount_cents is whole cents (e.g. $12.50 -> 1250), never a float."
 )
+
+# Ask First: model IDs shift over time -- these are reasonable defaults as of
+# this writing, override via LLM_MODEL if a provider's default has moved on.
+# base_url values are each provider's documented OpenAI-compatible endpoint.
+PROVIDER_CONFIGS = {
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "openai/gpt-oss-20b",
+        "api_key_env_var": "GROQ_API_KEY",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+        "api_key_env_var": "OPENAI_API_KEY",
+    },
+    "xai": {
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-4",
+        "api_key_env_var": "XAI_API_KEY",
+    },
+}
 
 
 class _ExtractionSchema(BaseModel):
-    """Wire schema for `messages.parse()`. Kept private to this adapter --
-    the domain-facing type is `ExtractedRefundFields`."""
+    """Wire schema the model's JSON output is validated against. Kept
+    private to this adapter -- the domain-facing type is
+    `ExtractedRefundFields`."""
 
     order_reference: str
     reason: str
     amount_cents: Optional[int] = None
 
 
-class AnthropicLLMExtractionAdapter(LLMPort):
-    """LLMPort implementation backed by the Anthropic Claude API."""
+class OpenAICompatibleLLMExtractionAdapter(LLMPort):
+    """LLMPort implementation for any provider serving OpenAI's chat
+    completions wire protocol (Groq, OpenAI, xAI/Grok, ...). No provider
+    branching lives here -- `base_url`/`model`/the API key are the only
+    per-provider differences, all supplied by the caller."""
 
     def __init__(
         self,
-        client: Optional[anthropic.Anthropic] = None,
-        model: str = DEFAULT_MODEL,
+        base_url: str,
+        api_key: str,
+        model: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        # `anthropic.Anthropic()` resolves credentials from the environment
-        # (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / an `ant auth login`
-        # profile) -- never hardcode a key here.
-        base_client = client or anthropic.Anthropic()
-        # `with_options` returns a new client with the override applied --
-        # it doesn't mutate `base_client` -- so this is safe even when a
-        # shared client is passed in.
-        self._client = base_client.with_options(timeout=timeout_seconds)
+        self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout_seconds)
         self._model = model
 
     def extract_refund_request(self, chat_text: str) -> ExtractedRefundFields:
-        response = self._client.messages.parse(
+        response = self._client.chat.completions.create(
             model=self._model,
             max_tokens=1024,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": chat_text}],
-            output_format=_ExtractionSchema,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": chat_text},
+            ],
         )
-        parsed = response.parsed_output
+        content = response.choices[0].message.content
+        parsed = _ExtractionSchema.model_validate_json(content)
         return ExtractedRefundFields(
             order_reference=parsed.order_reference.strip(),
             reason=parsed.reason.strip(),
@@ -88,13 +115,23 @@ class AnthropicLLMExtractionAdapter(LLMPort):
         )
 
 
-def build_default_llm_port() -> LLMPort:
-    """Composition-root helper for `api/main.py`. Raises early and clearly
-    if ANTHROPIC_API_KEY is missing, rather than failing on the first chat
+def build_llm_port(provider: str) -> LLMPort:
+    """Composition-root helper for `api/main.py`. `provider` must be a key
+    in PROVIDER_CONFIGS. Raises early and clearly if the provider is unknown
+    or its API key is missing, rather than failing on the first chat
     request."""
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+    config = PROVIDER_CONFIGS.get(provider)
+    if config is None:
+        known = ", ".join(sorted(PROVIDER_CONFIGS))
+        raise RuntimeError(f"Unknown LLM_PROVIDER '{provider}'. Known providers: {known}.")
+
+    api_key = os.environ.get(config["api_key_env_var"])
+    if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) must be set to use "
-            "AnthropicLLMExtractionAdapter."
+            f"{config['api_key_env_var']} must be set to use provider '{provider}'."
         )
-    return AnthropicLLMExtractionAdapter()
+
+    model = os.environ.get("LLM_MODEL", config["default_model"])
+    return OpenAICompatibleLLMExtractionAdapter(
+        base_url=config["base_url"], api_key=api_key, model=model
+    )
