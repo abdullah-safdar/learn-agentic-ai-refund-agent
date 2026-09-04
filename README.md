@@ -15,10 +15,27 @@ Python / FastAPI / Pydantic v2 backend, React / Next.js frontend, PostgreSQL. St
 **Backend:**
 ```bash
 cd backend
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in DATABASE_URL and ANTHROPIC_API_KEY
-uvicorn api.main:app --reload
+cp .env.example .env   # fill in DATABASE_URL, GROQ_API_KEY, STRIPE_SECRET_KEY
+uvicorn main:app --reload --env-file .env
 ```
+
+**Getting the API keys** for `.env`:
+
+- **Groq** (free, default LLM provider — used to extract refund requests from chat):
+  1. Go to [console.groq.com/keys](https://console.groq.com/keys) and sign in (or create a free account).
+  2. Click **Create API Key**, name it, and copy the value (starts with `gsk_...`).
+  3. Paste it into `.env` as `GROQ_API_KEY=gsk_...`. Leave `LLM_PROVIDER=groq` as-is.
+
+- **Stripe** (test mode — needed from Stage 1.2 onward for the refund call; no real payments are ever made):
+  1. Go to [dashboard.stripe.com](https://dashboard.stripe.com) and sign in (or create a free account) — no business details required to get test keys.
+  2. Make sure the dashboard is in **Test mode** (toggle in the top-right corner).
+  3. Go to [dashboard.stripe.com/test/apikeys](https://dashboard.stripe.com/test/apikeys) and copy the **Secret key** (starts with `sk_test_...`).
+  4. Paste it into `.env` as `STRIPE_SECRET_KEY=sk_test_...`.
+
+Never commit `.env` or paste real (non-test) keys into it — `.env` is already gitignored.
 
 **Frontend:**
 ```bash

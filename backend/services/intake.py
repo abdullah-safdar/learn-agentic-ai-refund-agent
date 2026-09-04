@@ -1,56 +1,35 @@
-"""Intake-dedup + RefundRequest creation flow (AD-3).
+"""Turns a chat message into a RefundRequest: extract fields, check for a
+duplicate submission, create a new row if none matched.
 
-Order of operations matters (see the spec's Design Notes): run extraction
-first (to get `order_reference`), *then* compute the dedup key and check for
-an existing row, *then* create a new row only if none matched. Checking
-dedup before extraction isn't possible -- there's nothing to key on yet.
+Order of operations matters: extraction first (to get order_reference),
+*then* compute the dedup key and check for an existing row, *then* create a
+new row only if none matched -- there's nothing to key on before extraction
+runs.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Union
+from typing import Optional
 
-from domain.models import RefundRequest
-from domain.ports import LLMPort, RefundRepositoryPort
+import db
+from models import ClarificationNeeded, IntakeOutcome, IntakeResult, RefundRequest
+from services import llm
 
-# Ask First (spec): the exact intake-dedup time window wasn't already
-# decided, so this picks the spec's own suggested default of 5 minutes.
-# Flag for renegotiation if a different value is wanted.
+# The dedup time window wasn't pinned down elsewhere, so this picks a
+# sensible default. Change it here if a different value is wanted.
 DEDUP_WINDOW_SECONDS = 300
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
 class ExtractionError(Exception):
-    """Raised when the LLMPort fails to produce extraction output at all
-    (e.g. the provider call errors out). Distinct from "nothing was
-    stated in the message", which is a normal ClarificationNeeded result,
-    not an error.
+    """Raised when llm.extract_refund_request() fails outright (e.g. the
+    provider call errors out) -- distinct from "nothing was stated in the
+    message", which is a normal ClarificationNeeded result, not an error.
     """
-
-
-@dataclass(frozen=True)
-class ClarificationNeeded:
-    """No RefundRequest was created; the customer should be asked to
-    clarify (I/O matrix: "Missing order reference")."""
-
-    message: str
-
-
-@dataclass(frozen=True)
-class IntakeResult:
-    """A RefundRequest now exists for this submission -- either freshly
-    created, or an existing row reused via intake dedup."""
-
-    refund_request: RefundRequest
-    created: bool
-
-
-IntakeOutcome = Union[IntakeResult, ClarificationNeeded]
 
 
 def normalize_reason(reason: str) -> str:
@@ -62,7 +41,7 @@ def normalize_reason(reason: str) -> str:
 def _normalize_order_reference_for_key(order_reference: str) -> str:
     """Normalization applied only when computing the dedup key -- casing
     differences (e.g. "ORD-1234" vs "ord-1234") shouldn't defeat dedup. The
-    stored/displayed `order_reference` value itself is never altered."""
+    stored/displayed order_reference itself is never altered."""
     return order_reference.strip().lower()
 
 
@@ -86,9 +65,9 @@ def _encode_key_parts(*parts: str) -> bytes:
 
 def compute_dedup_key(order_reference: str, reason: str, now: datetime) -> str:
     """Deterministic key from (order_reference, normalized_reason,
-    time_window) per AD-3. `time_window` is folded in as a bucketed window
-    index (`now` divided into DEDUP_WINDOW_SECONDS-wide buckets) so the
-    repository can do a plain equality lookup instead of a time-range query.
+    time_window). `time_window` is folded in as a bucketed window index
+    (`now` divided into DEDUP_WINDOW_SECONDS-wide buckets) so a lookup can
+    be a plain equality check instead of a time-range query.
 
     `now` must be timezone-aware. A naive datetime would be interpreted as
     local server time by `.timestamp()`, silently shifting dedup window
@@ -109,22 +88,16 @@ def compute_dedup_key(order_reference: str, reason: str, now: datetime) -> str:
     return hashlib.sha256(key_material).hexdigest()
 
 
-def submit_chat_message(
-    chat_text: str,
-    llm: LLMPort,
-    repo: RefundRepositoryPort,
-    now: Optional[datetime] = None,
-) -> IntakeOutcome:
+def submit_chat_message(chat_text: str, now: Optional[datetime] = None) -> IntakeOutcome:
     """Extract a fixed schema from `chat_text`, dedup-check, and create a
-    RefundRequest if needed. This is the single entry point adapters
-    (the chat API route) should call -- it owns the ordering AD-3 requires.
-    """
+    RefundRequest if needed. The single entry point the chat API route
+    calls -- it owns the ordering above."""
     current_time = now or datetime.now(timezone.utc)
 
     try:
         extracted = llm.extract_refund_request(chat_text)
-    except Exception as exc:  # noqa: BLE001 -- translate any adapter failure
-        raise ExtractionError(f"LLMPort extraction failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 -- translate any provider failure
+        raise ExtractionError(f"LLM extraction failed: {exc}") from exc
 
     order_reference = extracted.order_reference.strip()
     if not order_reference:
@@ -138,7 +111,7 @@ def submit_chat_message(
     reason = extracted.reason.strip()
     dedup_key = compute_dedup_key(order_reference, reason, current_time)
 
-    existing = repo.find_by_dedup_key(dedup_key)
+    existing = db.find_refund_request_by_dedup_key(dedup_key)
     if existing is not None:
         return IntakeResult(refund_request=existing, created=False)
 
@@ -147,19 +120,17 @@ def submit_chat_message(
         reason=reason,
         amount_cents=extracted.amount_cents,
     )
-    inserted = repo.save(refund_request, dedup_key)
+    inserted = db.save_refund_request(refund_request, dedup_key)
     if not inserted:
         # Lost a concurrent insert race: some other submission persisted a
-        # row under this exact dedup_key between our find_by_dedup_key
-        # check above and this save() call. The locally-built
-        # `refund_request` above was never actually persisted -- returning
-        # it would silently misreport a phantom row's id/fields to the
-        # caller. Re-fetch and hand back the row that actually won instead.
-        winning_request = repo.find_by_dedup_key(dedup_key)
+        # row under this exact dedup_key between our find/save calls above.
+        # The locally-built refund_request was never actually persisted --
+        # re-fetch and hand back the row that actually won instead.
+        winning_request = db.find_refund_request_by_dedup_key(dedup_key)
         if winning_request is None:
             raise RuntimeError(
-                "RefundRepositoryPort.save() reported no insert occurred, "
-                "but no row was found for its dedup_key on re-fetch."
+                "save_refund_request() reported no insert occurred, but no "
+                "row was found for its dedup_key on re-fetch."
             )
         return IntakeResult(refund_request=winning_request, created=False)
 

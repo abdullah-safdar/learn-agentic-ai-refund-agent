@@ -1,0 +1,129 @@
+<svg viewBox="0 0 900 680" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flowchart of the Agent Loop: a request passes through Order Lookup, amount resolution, Policy Check, and Stripe Refund. Every failure path leads to Escalated (amber); only a genuine bug leads to Failed (red, dashed); the clean path leads to Completed (green).">
+  <title>Stage 1.2 — The Agent Loop</title>
+  <desc>Order Lookup (retried up to 3 times) feeds Policy Check, which feeds Stripe Refund (a single attempt). Any of the three steps failing routes to Escalated. Only an unexpected bug routes to Failed. Only the fully clean path reaches Completed.</desc>
+
+  <defs>
+    <marker id="arrowN" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8B8579"/>
+    </marker>
+    <marker id="arrowOk" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1F8A5A"/>
+    </marker>
+    <marker id="arrowWarn" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#A6720A"/>
+    </marker>
+    <marker id="arrowBad" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#B23A3A"/>
+    </marker>
+  </defs>
+
+  <style>
+    .box{fill:#FFFFFF;stroke:#B9B2A2;stroke-width:1.6}
+    .box-ok{fill:#E4F5EC;stroke:#1F8A5A;stroke-width:2}
+    .box-warn{fill:#F7ECD8;stroke:#A6720A;stroke-width:2}
+    .box-bad{fill:#F8E6E4;stroke:#B23A3A;stroke-width:2;stroke-dasharray:6 4}
+    .tag{font:600 11px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#7A756A;letter-spacing:.06em}
+    .title{font:600 15px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#1C2024}
+    .title-ok{font:600 16px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#1F8A5A}
+    .title-warn{font:600 16px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#A6720A}
+    .title-bad{font:600 16px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#B23A3A}
+    .sub{font:400 12px 'IBM Plex Sans',system-ui,sans-serif;fill:#5B6169}
+    .sub-warn{font:400 12px 'IBM Plex Sans',system-ui,sans-serif;fill:#8A6417}
+    .edge{fill:none;stroke:#8B8579;stroke-width:1.8}
+    .edge-ok{fill:none;stroke:#1F8A5A;stroke-width:2.2}
+    .edge-warn{fill:none;stroke:#A6720A;stroke-width:2.2}
+    .edge-bad{fill:none;stroke:#B23A3A;stroke-width:2.2;stroke-dasharray:6 4}
+    .lbl{font:500 12px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#5B6169}
+    .lbl-warn{font:500 12px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#A6720A}
+    .lbl-ok{font:500 12px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#1F8A5A}
+    .lbl-bad{font:500 12px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#B23A3A}
+    .lblbg{fill:#F7F5F0}
+    .legend{font:400 11.5px 'IBM Plex Mono',ui-monospace,Consolas,monospace;fill:#7A756A}
+  </style>
+
+  <rect x="0" y="0" width="900" height="680" fill="#F7F5F0"/>
+
+  <!-- ===== edges ===== -->
+  <path class="edge" d="M170,80 L170,104" marker-end="url(#arrowN)"/>
+  <path class="edge" d="M170,196 L170,226" marker-end="url(#arrowN)"/>
+  <path class="edge" d="M170,282 L170,312" marker-end="url(#arrowN)"/>
+  <path class="edge" d="M170,404 L170,434" marker-end="url(#arrowN)"/>
+  <path class="edge-ok" d="M170,526 L170,556" marker-end="url(#arrowOk)"/>
+
+  <path class="edge-warn" d="M290,126 C 440,126 440,284 560,284" marker-end="url(#arrowWarn)"/>
+  <path class="edge-warn" d="M290,350 C 440,350 440,320 560,320" marker-end="url(#arrowWarn)"/>
+  <path class="edge-warn" d="M290,470 C 440,470 440,356 560,356" marker-end="url(#arrowWarn)"/>
+
+  <path class="edge-bad" d="M206,40 C 350,-10 480,10 560,66" marker-end="url(#arrowBad)"/>
+
+  <!-- ===== edge labels ===== -->
+  <g><rect class="lblbg" x="176" y="203" width="130" height="18"/><text class="lbl" x="178" y="217">found / not found</text></g>
+  <g><rect class="lblbg" x="176" y="407" width="78" height="18"/><text class="lbl" x="178" y="421">compliant</text></g>
+  <g><rect class="lblbg" x="176" y="529" width="64" height="18"/><text class="lbl-ok" x="178" y="543">success</text></g>
+
+  <g><rect class="lblbg" x="404" y="112" width="130" height="18"/><text class="lbl-warn" x="406" y="126">retries exhausted</text></g>
+  <g><rect class="lblbg" x="404" y="336" width="120" height="18"/><text class="lbl-warn" x="406" y="350">non-compliant</text></g>
+  <g><rect class="lblbg" x="404" y="452" width="150" height="18"/><text class="lbl-warn" x="406" y="466">fails / injected / limited</text></g>
+
+  <g><rect class="lblbg" x="330" y="6" width="210" height="18"/><text class="lbl-bad" x="332" y="20">unexpected exception, anywhere</text></g>
+
+  <!-- ===== nodes ===== -->
+  <g>
+    <rect class="box" x="60" y="28" width="220" height="52" rx="26"/>
+    <text class="title" x="170" y="60" text-anchor="middle">New Request</text>
+  </g>
+
+  <g>
+    <rect class="box" x="60" y="104" width="230" height="92" rx="14"/>
+    <text class="tag" x="80" y="129">1 · ORDER LOOKUP</text>
+    <text class="title" x="80" y="154">find_order_by_reference</text>
+    <text class="sub" x="80" y="174">up to 3 attempts</text>
+    <text class="sub" x="80" y="190">injection + rate-limit check first</text>
+  </g>
+
+  <g>
+    <rect class="box" x="60" y="226" width="230" height="56" rx="12"/>
+    <text class="title" x="80" y="252">Resolve amount</text>
+    <text class="sub" x="80" y="270">null → order's full amount</text>
+  </g>
+
+  <g>
+    <rect class="box" x="60" y="312" width="230" height="92" rx="14"/>
+    <text class="tag" x="80" y="337">2 · POLICY CHECK</text>
+    <text class="title" x="80" y="362">evaluate_policy(...)</text>
+    <text class="sub" x="80" y="382">4 hardcoded rules</text>
+    <text class="sub" x="80" y="398">today's stand-in for a real AI check</text>
+  </g>
+
+  <g>
+    <rect class="box" x="60" y="434" width="230" height="92" rx="14"/>
+    <text class="tag" x="80" y="459">3 · STRIPE REFUND</text>
+    <text class="title" x="80" y="484">issue_refund(...)</text>
+    <text class="sub" x="80" y="504">exactly one attempt</text>
+    <text class="sub" x="80" y="520">never retried</text>
+  </g>
+
+  <g>
+    <rect class="box-ok" x="60" y="556" width="230" height="68" rx="14"/>
+    <text class="title-ok" x="175" y="586" text-anchor="middle">✓ Completed</text>
+    <text class="sub" x="175" y="606" text-anchor="middle">refund issued, money moved</text>
+  </g>
+
+  <g>
+    <rect class="box-warn" x="560" y="276" width="260" height="96" rx="14"/>
+    <text class="title-warn" x="690" y="316" text-anchor="middle">⚠ Escalated</text>
+    <text class="sub-warn" x="690" y="338" text-anchor="middle">handed to a human,</text>
+    <text class="sub-warn" x="690" y="354" text-anchor="middle">never autonomously denied</text>
+  </g>
+
+  <g>
+    <rect class="box-bad" x="560" y="34" width="260" height="60" rx="14"/>
+    <text class="title-bad" x="690" y="60" text-anchor="middle">✗ Failed</text>
+    <text class="sub" x="690" y="78" text-anchor="middle">a bug, not a business outcome</text>
+  </g>
+
+  <!-- ===== legend ===== -->
+  <line x1="60" y1="648" x2="90" y2="648" class="edge-bad"/>
+  <text class="legend" x="96" y="652">unexpected bug, can strike from any step</text>
+  <text class="legend" x="60" y="670">Arrow color = where it leads: gray → next step · amber → Escalated · green → Completed</text>
+</svg>

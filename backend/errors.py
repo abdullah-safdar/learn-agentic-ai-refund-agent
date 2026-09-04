@@ -1,10 +1,5 @@
 """Shared error-envelope wiring: `{ "error": { "code", "message", "details" } }`
-for every error response, per the architecture's Consistency Conventions.
-
-Factored out of `api/main.py` so tests can register the exact same handlers
-on a test-only FastAPI app and verify the real response shape (e.g. the
-rate-limit 429 in `tests/test_intake.py`), instead of relying on FastAPI's
-default `{"detail": ...}` wrapping.
+for every error response.
 """
 
 from __future__ import annotations
@@ -17,7 +12,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from domain.intake import ExtractionError
+from services.agent_loop import AgentLoopFailedError
+from services.intake import ExtractionError
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +43,10 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ExtractionError)
     async def _extraction_error_handler(request, exc: ExtractionError) -> JSONResponse:
-        # The LLM Port failed outright (not merely "nothing stated") -- a
-        # customer-visible clarification prompt isn't right here since we
-        # never got extraction output at all. Clean envelope, not a raw 500.
-        # Log the real exception (never returned to the client) so a
-        # provider outage/error is diagnosable from server logs -- per
-        # AD-11, this must never include secrets, only the exception itself.
+        # The LLM extraction call failed outright (not merely "nothing
+        # stated") -- log the real exception (never returned to the
+        # client) so a provider outage/error is diagnosable from server
+        # logs, without leaking any secrets.
         logger.exception("Refund chat extraction failed", exc_info=exc)
         return JSONResponse(
             status_code=502,
@@ -60,6 +54,25 @@ def register_error_handlers(app: FastAPI) -> None:
                 "error": {
                     "code": "extraction_failed",
                     "message": "Couldn't process that message right now. Please try again shortly.",
+                    "details": None,
+                }
+            },
+        )
+
+    @app.exception_handler(AgentLoopFailedError)
+    async def _agent_loop_failed_handler(request, exc: AgentLoopFailedError) -> JSONResponse:
+        # The Agent Loop resolved to AgentResult.Failed -- an unexpected/
+        # internal resolution failure (a normal Tool failure escalates
+        # instead). Log the real reason (never returned to the client); the
+        # RefundRequest row has already been persisted as "failed" by the
+        # caller before this is raised.
+        logger.exception("Agent Loop resolution failed", exc_info=exc)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "code": "resolution_failed",
+                    "message": "Couldn't resolve that refund request right now. Please try again shortly.",
                     "details": None,
                 }
             },

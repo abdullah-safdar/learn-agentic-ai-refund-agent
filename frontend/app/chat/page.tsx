@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { Suspense, useEffect, useState, type FormEvent } from "react";
+import { useSearchParams } from "next/navigation";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -14,7 +15,7 @@ type RefundRequestSummary = {
 };
 
 type ChatSubmissionResponse = {
-  type: "confirmation" | "clarification";
+  type: "confirmation" | "clarification" | "escalated";
   message: string;
   refund_request?: RefundRequestSummary | null;
   deduplicated?: boolean | null;
@@ -46,10 +47,23 @@ function newId(): string {
     : `${Date.now()}-${Math.random()}`;
 }
 
-export default function ChatPage() {
+function statusBadgeClass(status: string): string {
+  return `badge badge--${status}`;
+}
+
+function ChatPageInner() {
+  const searchParams = useSearchParams();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  useEffect(() => {
+    const orderReference = searchParams.get("order");
+    if (orderReference) {
+      setInput(`I'd like a refund for order ${orderReference}.`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -113,110 +127,95 @@ export default function ChatPage() {
   }
 
   return (
-    <main style={{ maxWidth: 640, margin: "0 auto", padding: "2rem 1rem" }}>
-      <h1 style={{ fontSize: "1.25rem", marginBottom: "1rem" }}>Refund Request Chat</h1>
-
-      <div
-        style={{
-          border: "1px solid #ddd",
-          borderRadius: 8,
-          minHeight: 320,
-          padding: "1rem",
-          marginBottom: "1rem",
-          background: "#fff",
-          display: "flex",
-          flexDirection: "column",
-          gap: "0.75rem",
-        }}
-        aria-live="polite"
-      >
-        {messages.length === 0 && (
-          <p style={{ color: "#888" }}>
-            Tell us about the order you&apos;d like refunded -- e.g. &quot;Refund order
-            #ORD-1234, wrong size&quot;.
-          </p>
-        )}
-
-        {messages.map((message) => (
-          <div
-            key={message.id}
-            style={{
-              alignSelf: message.role === "customer" ? "flex-end" : "flex-start",
-              maxWidth: "85%",
-              background:
-                message.role === "customer"
-                  ? "#daf1ff"
-                  : message.role === "agent" && message.isError
-                    ? "#ffe1e1"
-                    : "#eee",
-              borderRadius: 8,
-              padding: "0.5rem 0.75rem",
-            }}
-          >
-            <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{message.text}</p>
-            {message.role === "agent" && message.refundRequest && (
-              <dl
-                style={{
-                  margin: "0.5rem 0 0",
-                  fontSize: "0.85rem",
-                  color: "#333",
-                  display: "grid",
-                  gridTemplateColumns: "auto 1fr",
-                  columnGap: "0.5rem",
-                  rowGap: "0.15rem",
-                }}
-              >
-                <dt>Request ID</dt>
-                <dd>{message.refundRequest.id}</dd>
-                <dt>Order</dt>
-                <dd>{message.refundRequest.order_reference}</dd>
-                <dt>Reason</dt>
-                <dd>{message.refundRequest.reason}</dd>
-                <dt>Amount</dt>
-                <dd>{formatAmount(message.refundRequest.amount_cents)}</dd>
-                <dt>Status</dt>
-                <dd>{message.refundRequest.status}</dd>
-                {message.deduplicated && (
-                  <>
-                    <dt>Note</dt>
-                    <dd>Matched an existing recent request</dd>
-                  </>
-                )}
-              </dl>
-            )}
-          </div>
-        ))}
+    <main className="shell">
+      <div className="page-header">
+        <h1>Refund Request Chat</h1>
+        <p>Describe your order and the reason -- the agent takes it from there.</p>
       </div>
 
-      <form onSubmit={handleSubmit} style={{ display: "flex", gap: "0.5rem" }}>
-        <input
-          type="text"
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          placeholder="Describe your refund request..."
-          disabled={isSubmitting}
-          style={{
-            flex: 1,
-            padding: "0.6rem 0.75rem",
-            borderRadius: 6,
-            border: "1px solid #ccc",
-          }}
-        />
-        <button
-          type="submit"
-          disabled={isSubmitting || !input.trim()}
-          style={{
-            padding: "0.6rem 1.2rem",
-            borderRadius: 6,
-            border: "none",
-            background: "#0070f3",
-            color: "#fff",
-            cursor: isSubmitting ? "not-allowed" : "pointer",
-          }}
-        >
-          {isSubmitting ? "Sending..." : "Send"}
-        </button>
-      </form>
+      <div className="card chat-card">
+        <div className="chat-header">
+          <span className="chat-header__avatar">🤖</span>
+          <div>
+            <div className="chat-header__title">Refund Assistant</div>
+            <div className="chat-header__subtitle">Order lookup &middot; policy check &middot; Stripe refund</div>
+          </div>
+        </div>
+
+        <div className="chat-body">
+          {messages.length === 0 && (
+            <p className="chat-empty">
+              Tell us about the order you&apos;d like refunded -- e.g. &quot;Refund order
+              #ORD-1234, wrong size&quot;.
+            </p>
+          )}
+
+          {messages.map((message) => (
+            <div
+              key={message.id}
+              className={`bubble-row bubble-row--${message.role}`}
+            >
+              <div
+                className={`bubble ${
+                  message.role === "customer"
+                    ? "bubble--customer"
+                    : message.role === "agent" && message.isError
+                      ? "bubble--error"
+                      : "bubble--agent"
+                }`}
+              >
+                <p>{message.text}</p>
+                {message.role === "agent" && message.refundRequest && (
+                  <dl className="bubble-meta">
+                    <dt>Request ID</dt>
+                    <dd className="mono">{message.refundRequest.id}</dd>
+                    <dt>Order</dt>
+                    <dd>{message.refundRequest.order_reference}</dd>
+                    <dt>Reason</dt>
+                    <dd>{message.refundRequest.reason || "—"}</dd>
+                    <dt>Amount</dt>
+                    <dd>{formatAmount(message.refundRequest.amount_cents)}</dd>
+                    <dt>Status</dt>
+                    <dd>
+                      <span className={statusBadgeClass(message.refundRequest.status)}>
+                        {message.refundRequest.status}
+                      </span>
+                    </dd>
+                    {message.deduplicated && (
+                      <>
+                        <dt>Note</dt>
+                        <dd>Matched an existing recent request</dd>
+                      </>
+                    )}
+                  </dl>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <form onSubmit={handleSubmit} className="chat-form">
+          <input
+            type="text"
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            placeholder="Describe your refund request..."
+            disabled={isSubmitting}
+            className="input"
+          />
+          <button type="submit" disabled={isSubmitting || !input.trim()} className="btn btn-primary">
+            {isSubmitting ? <span className="spinner" /> : "Send"}
+          </button>
+        </form>
+      </div>
     </main>
+  );
+}
+
+export default function ChatPage() {
+  return (
+    <Suspense fallback={null}>
+      <ChatPageInner />
+    </Suspense>
   );
 }
