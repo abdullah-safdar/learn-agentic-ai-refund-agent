@@ -18,7 +18,7 @@ Start reading here: [`services/agent_loop.py:170`](../../backend/services/agent_
 
 Arrow color tells you where a step leads without having to trace the line: gray goes to the next step, amber goes to `Escalated`, green goes to `Completed`, dashed red is the one path that can strike from anywhere — an unexpected bug.
 
-**[→ Trace it interactively](https://claude.ai/code/artifact/fa2d6003-bab4-4ed9-a7ee-05f184d37c9e)** — click through five real scenarios (happy path, order not found, policy denial, a failed Stripe call, an unexpected bug) and watch the exact path light up step by step, with a line link into `agent_loop.py` for each one. The diagram above is the quick glance; that page is the one to actually learn from.
+**[→ Trace it interactively](./stage-1.2-agent-loop-walkthrough.html)** — click through five real scenarios (happy path, order not found, policy denial, a failed Stripe call, an unexpected bug) and watch the exact path light up step by step, with a line link into `agent_loop.py` for each one. The diagram above is the quick glance; that page is the one to actually learn from.
 
 Two things worth noticing in the shape of this diagram, not just its boxes: **`Escalated` has far more arrows pointing into it than `Failed` does** — almost everything that can go wrong routes there, because a flaky tool call or a policy "no" is a normal day, not a bug. And **the Stripe step has no retry loop drawn around it** at all, unlike Order Lookup — that missing loop is deliberate, not an oversight (see below).
 

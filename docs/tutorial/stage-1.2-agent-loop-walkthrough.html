@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Loop Walkthrough — Stage 1.2</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#F6F4EF; --surface:#FFFFFF; --ink:#1C2024; --ink-dim:#5B6169; --line:#D8D3C8; --line-strong:#B9B2A2;
+    --accent:#0F6E5C; --accent-soft:#E4F1EC;
+    --ok:#1F8A5A; --ok-soft:#E4F5EC;
+    --warn:#A6720A; --warn-soft:#F7ECD8;
+    --bad:#B23A3A; --bad-soft:#F8E6E4;
+    --mono:'IBM Plex Mono',ui-monospace,'SF Mono',Consolas,monospace;
+    --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#12181A; --surface:#182123; --ink:#E7E7E2; --ink-dim:#9AA3A0; --line:#2B3538; --line-strong:#3C4A4D;
+      --accent:#3FCDAE; --accent-soft:#173330;
+      --ok:#3ED28C; --ok-soft:#163A2A;
+      --warn:#E0A83E; --warn-soft:#3A2E12;
+      --bad:#E2665F; --bad-soft:#3A1E1C;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#12181A; --surface:#182123; --ink:#E7E7E2; --ink-dim:#9AA3A0; --line:#2B3538; --line-strong:#3C4A4D;
+    --accent:#3FCDAE; --accent-soft:#173330;
+    --ok:#3ED28C; --ok-soft:#163A2A;
+    --warn:#E0A83E; --warn-soft:#3A2E12;
+    --bad:#E2665F; --bad-soft:#3A1E1C;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink)}
+  body{
+    font-family:var(--sans);
+    padding:32px 20px 60px;
+  }
+  .wrap{max-width:1180px; margin:0 auto; display:flex; flex-direction:column; gap:22px}
+
+  header{display:flex; flex-direction:column; gap:8px; max-width:720px}
+  .eyebrow{
+    font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent); font-weight:600;
+  }
+  h1{
+    font-family:var(--mono); font-size:clamp(24px,3.4vw,34px); font-weight:600; margin:0;
+    text-wrap:balance; letter-spacing:-.01em;
+  }
+  .dek{margin:0; color:var(--ink-dim); font-size:15px; line-height:1.55; max-width:62ch}
+  .dek code{font-family:var(--mono); font-size:13px; background:var(--accent-soft); color:var(--accent); padding:1px 5px; border-radius:4px}
+
+  .pills{display:flex; flex-wrap:wrap; gap:8px}
+  button.pill{
+    font-family:var(--mono); font-size:12.5px; font-weight:500; letter-spacing:.01em;
+    padding:9px 14px; border-radius:999px; border:1.5px solid var(--line); background:var(--surface);
+    color:var(--ink); cursor:pointer; transition:border-color .15s,background .15s,color .15s,transform .1s;
+  }
+  button.pill:hover{border-color:var(--line-strong); transform:translateY(-1px)}
+  button.pill:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  button.pill[aria-pressed="true"]{background:var(--accent); border-color:var(--accent); color:var(--bg)}
+  button.pill.reset{color:var(--ink-dim)}
+
+  .board{
+    display:grid; grid-template-columns:minmax(0,1.55fr) minmax(280px,1fr); gap:22px; align-items:start;
+  }
+  @media (max-width:860px){ .board{grid-template-columns:1fr} }
+
+  .diagram-card, .panel{
+    background:var(--surface); border:1px solid var(--line); border-radius:16px;
+  }
+  .diagram-card{padding:6px; overflow-x:auto}
+  svg{display:block; width:100%; height:auto; min-width:560px}
+
+  .node{cursor:pointer}
+  .node rect{fill:var(--surface); stroke:var(--line); stroke-width:1.6; transition:stroke .25s,stroke-width .25s,fill .25s}
+  .node.dashed rect{stroke-dasharray:5 4}
+  .node .title{font-family:var(--mono); font-weight:600; fill:var(--ink); font-size:14px}
+  .node .sub{font-family:var(--sans); fill:var(--ink-dim); font-size:11.5px}
+  .node .tag{font-family:var(--mono); fill:var(--ink-dim); font-size:10.5px; letter-spacing:.06em}
+  .node:hover rect{stroke:var(--line-strong)}
+  .node:focus-visible rect{outline:2px solid var(--accent); outline-offset:2px}
+
+  .node[data-outcome="ok"] rect{stroke:var(--ok)}
+  .node[data-outcome="ok"] .title{fill:var(--ok)}
+  .node[data-outcome="warn"] rect{stroke:var(--warn)}
+  .node[data-outcome="warn"] .title{fill:var(--warn)}
+  .node[data-outcome="bad"] rect{stroke:var(--bad)}
+  .node[data-outcome="bad"] .title{fill:var(--bad)}
+
+  .node.is-dim{opacity:.32}
+  .node.is-active rect{stroke-width:2.75}
+  .node.is-active[data-outcome="ok"] rect{fill:var(--ok-soft)}
+  .node.is-active[data-outcome="warn"] rect{fill:var(--warn-soft)}
+  .node.is-active[data-outcome="bad"] rect{fill:var(--bad-soft)}
+  .node.is-active:not([data-outcome]) rect{fill:var(--accent-soft); stroke:var(--accent)}
+
+  .edge{fill:none; stroke:var(--line); stroke-width:1.6; color:var(--line); transition:stroke .25s,opacity .25s,color .25s}
+  .edge.dashed{stroke-dasharray:5 4}
+  .edge.is-active{stroke:var(--accent); color:var(--accent); stroke-width:2.5}
+  .edge.is-active.to-ok{stroke:var(--ok); color:var(--ok)}
+  .edge.is-active.to-warn{stroke:var(--warn); color:var(--warn)}
+  .edge.is-active.to-bad{stroke:var(--bad); color:var(--bad)}
+  .edge.is-dim{opacity:.22}
+
+  .edge-label rect{fill:var(--bg); opacity:.001}
+  .edge-label text{font-family:var(--mono); font-size:10.5px; fill:var(--ink-dim); transition:fill .25s}
+  .edge-label.is-active text{fill:var(--ink); font-weight:600}
+  .edge-label.is-dim text{opacity:.3}
+  .legend{fill:var(--ink-dim); font-family:var(--mono); font-size:10.5px}
+
+  .panel{padding:20px; display:flex; flex-direction:column; gap:14px; min-height:340px}
+  .panel h2{margin:0; font-family:var(--mono); font-size:13px; letter-spacing:.04em; color:var(--ink-dim); text-transform:uppercase}
+  .panel .hint{font-size:13.5px; color:var(--ink-dim); line-height:1.6}
+  .panel .hint kbd{font-family:var(--mono); background:var(--accent-soft); color:var(--accent); padding:1px 6px; border-radius:4px; font-size:12px}
+
+  .outcome-badge{
+    display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:12px; font-weight:600;
+    padding:5px 11px; border-radius:999px; width:fit-content; letter-spacing:.03em;
+  }
+  .outcome-badge.ok{background:var(--ok-soft); color:var(--ok)}
+  .outcome-badge.warn{background:var(--warn-soft); color:var(--warn)}
+  .outcome-badge.bad{background:var(--bad-soft); color:var(--bad)}
+
+  .steps{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; counter-reset:step}
+  .steps li{
+    counter-increment:step; padding:10px 10px 10px 34px; border-radius:10px; position:relative;
+    font-size:13.5px; line-height:1.5; cursor:default; transition:background .15s;
+  }
+  .steps li:hover{background:var(--accent-soft)}
+  .steps li::before{
+    content:counter(step); position:absolute; left:9px; top:10px; width:18px; height:18px; border-radius:50%;
+    background:var(--line); color:var(--surface); font-family:var(--mono); font-size:10.5px; font-weight:600;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .steps li strong{display:block; font-weight:600; margin-bottom:2px}
+  .steps li a{
+    font-family:var(--mono); font-size:11.5px; color:var(--accent); text-decoration:none; border-bottom:1px dotted currentColor;
+  }
+  .steps li a:hover{opacity:.75}
+
+  .node-detail{display:flex; flex-direction:column; gap:8px}
+  .node-detail p{margin:0; font-size:13.5px; line-height:1.6; color:var(--ink)}
+  .node-detail a{font-family:var(--mono); font-size:12px; color:var(--accent)}
+
+  footer{color:var(--ink-dim); font-size:12.5px; font-family:var(--mono)}
+  footer a{color:var(--ink-dim)}
+
+  @media (prefers-reduced-motion:reduce){ *{transition:none !important} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Stage 1.2 · services/agent_loop.py</div>
+    <h1>How the Agent Loop Decides</h1>
+    <p class="dek">Five real request scenarios traced through the exact same code path. Click a scenario to trace it end-to-end, or click any box to see what it does on its own. Almost everything routes to <code>Escalated</code> — that's deliberate.</p>
+  </header>
+
+  <div class="pills" role="group" aria-label="Scenarios">
+    <button class="pill" data-scenario="happy" aria-pressed="false">① Happy path</button>
+    <button class="pill" data-scenario="notfound" aria-pressed="false">② Order not found</button>
+    <button class="pill" data-scenario="denied" aria-pressed="false">③ Policy denies it</button>
+    <button class="pill" data-scenario="stripefails" aria-pressed="false">④ Stripe call fails</button>
+    <button class="pill" data-scenario="bug" aria-pressed="false">⑤ Unexpected bug</button>
+    <button class="pill reset" data-scenario="reset" aria-pressed="false">✕ Reset</button>
+  </div>
+
+  <div class="board">
+    <div class="diagram-card">
+      <svg viewBox="0 0 900 660" role="img" aria-label="Flowchart of the Agent Loop: a request passes through Order Lookup, amount resolution, Policy Check, and Stripe Refund, exiting as Completed, Escalated, or Failed.">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+
+        <!-- edges (drawn first, under nodes) -->
+        <path id="e-start-ol" class="edge" d="M170,66 L170,90" marker-end="url(#arrow)"/>
+        <path id="e-ol-amount" class="edge" data-to="" d="M170,180 L170,210" marker-end="url(#arrow)"/>
+        <path id="e-amount-policy" class="edge" d="M170,264 L170,294" marker-end="url(#arrow)"/>
+        <path id="e-policy-stripe" class="edge" d="M170,384 L170,414" marker-end="url(#arrow)"/>
+        <path id="e-stripe-completed" class="edge" data-to="ok" d="M170,504 L170,534" marker-end="url(#arrow)"/>
+
+        <path id="e-ol-escalated" class="edge" data-to="warn" d="M280,112 C 430,112 430,266 560,266" marker-end="url(#arrow)"/>
+        <path id="e-policy-escalated" class="edge" data-to="warn" d="M280,330 C 430,330 430,302 560,302" marker-end="url(#arrow)"/>
+        <path id="e-stripe-escalated" class="edge" data-to="warn" d="M280,448 C 430,448 430,338 560,338" marker-end="url(#arrow)"/>
+
+        <path id="e-start-failed" class="edge dashed" data-to="bad" d="M196,28 C 340,-16 470,4 560,52" marker-end="url(#arrow)"/>
+
+        <!-- edge labels -->
+        <g class="edge-label" data-edge="e-ol-amount"><rect x="176" y="187" width="98" height="16"/><text x="178" y="199">found / not found</text></g>
+        <g class="edge-label" data-edge="e-policy-stripe"><rect x="176" y="391" width="70" height="16"/><text x="178" y="403">compliant</text></g>
+        <g class="edge-label" data-edge="e-stripe-completed"><rect x="176" y="511" width="58" height="16"/><text x="178" y="523">success</text></g>
+        <g class="edge-label" data-edge="e-ol-escalated"><rect x="392" y="98" width="120" height="16"/><text x="394" y="110">retries exhausted</text></g>
+        <g class="edge-label" data-edge="e-policy-escalated"><rect x="392" y="316" width="110" height="16"/><text x="394" y="328">non-compliant</text></g>
+        <g class="edge-label" data-edge="e-stripe-escalated"><rect x="392" y="424" width="130" height="16"/><text x="394" y="436">fails / injected / limited</text></g>
+        <g class="edge-label" data-edge="e-start-failed"><rect x="330" y="0" width="190" height="16"/><text x="332" y="12">unexpected exception, anywhere</text></g>
+
+        <!-- nodes -->
+        <g class="node" id="n-start" data-detail="start" tabindex="0" role="button" aria-label="New Request">
+          <rect x="60" y="14" width="220" height="52" rx="26"/>
+          <text class="title" x="170" y="46" text-anchor="middle">New Request</text>
+        </g>
+
+        <g class="node" id="n-ol" data-detail="ol" tabindex="0" role="button" aria-label="Order Lookup">
+          <rect x="60" y="90" width="220" height="90" rx="14"/>
+          <text class="tag" x="80" y="115">1 · ORDER LOOKUP</text>
+          <text class="title" x="80" y="140">db.find_order_by_reference</text>
+          <text class="sub" x="80" y="160">up to 3 attempts · injection + rate-limit check first</text>
+        </g>
+
+        <g class="node" id="n-amount" data-detail="amount" tabindex="0" role="button" aria-label="Resolve amount">
+          <rect x="60" y="210" width="220" height="54" rx="12"/>
+          <text class="title" x="80" y="234">Resolve amount</text>
+          <text class="sub" x="80" y="252">null → order's full amount</text>
+        </g>
+
+        <g class="node" id="n-policy" data-detail="policy" tabindex="0" role="button" aria-label="Policy Check">
+          <rect x="60" y="294" width="220" height="90" rx="14"/>
+          <text class="tag" x="80" y="319">2 · POLICY CHECK</text>
+          <text class="title" x="80" y="344">evaluate_policy(...)</text>
+          <text class="sub" x="80" y="364">4 hardcoded rules · today's stand-in</text>
+        </g>
+
+        <g class="node" id="n-stripe" data-detail="stripe" tabindex="0" role="button" aria-label="Stripe Refund">
+          <rect x="60" y="414" width="220" height="90" rx="14"/>
+          <text class="tag" x="80" y="439">3 · STRIPE REFUND</text>
+          <text class="title" x="80" y="464">stripe_refund.issue_refund</text>
+          <text class="sub" x="80" y="484">exactly one attempt · never retried</text>
+        </g>
+
+        <g class="node" id="n-completed" data-outcome="ok" data-detail="completed" tabindex="0" role="button" aria-label="Completed">
+          <rect x="60" y="534" width="220" height="66" rx="14"/>
+          <text class="title" x="170" y="574" text-anchor="middle">✓ Completed</text>
+        </g>
+
+        <g class="node" id="n-escalated" data-outcome="warn" data-detail="escalated" tabindex="0" role="button" aria-label="Escalated">
+          <rect x="560" y="256" width="260" height="90" rx="14"/>
+          <text class="title" x="690" y="296" text-anchor="middle">⚠ Escalated</text>
+          <text class="sub" x="690" y="316" text-anchor="middle">handed to a human, never denied</text>
+        </g>
+
+        <g class="node dashed" id="n-failed" data-outcome="bad" data-detail="failed" tabindex="0" role="button" aria-label="Failed">
+          <rect x="560" y="18" width="260" height="60" rx="14"/>
+          <text class="title" x="690" y="44" text-anchor="middle">✗ Failed</text>
+          <text class="sub" x="690" y="62" text-anchor="middle">a bug, not a business outcome</text>
+        </g>
+
+        <text class="legend" x="60" y="628">— solid = normal outcome · - - - = an unexpected bug, can strike from any step</text>
+      </svg>
+    </div>
+
+    <aside class="panel" id="panel" aria-live="polite">
+      <h2>What's happening</h2>
+      <div class="hint">
+        Pick a scenario above to trace the exact path a request takes — or click any box in the diagram to read what that step does on its own.
+      </div>
+    </aside>
+  </div>
+
+  <footer>services/agent_loop.py — see <a href="./story-1.2.md">Stage 1.2</a> for the full write-up</footer>
+</div>
+
+<script>
+(function(){
+  var REPO_BASE = "../../backend/services/agent_loop.py";
+
+  var scenarios = {
+    happy: {
+      label: "Happy path",
+      outcome: "ok",
+      nodes: ["n-start","n-ol","n-amount","n-policy","n-stripe","n-completed"],
+      edges: ["e-start-ol","e-ol-amount","e-amount-policy","e-policy-stripe","e-stripe-completed"],
+      steps: [
+        {t:"Order Lookup succeeds", d:"Found on the first attempt — no retry needed.", line:88},
+        {t:"Amount resolves", d:"Customer stated an amount (or it falls back to the order's full total).", line:138},
+        {t:"Policy passes", d:"All four rules check out: completed order, inside the return window, positive amount, not over the order total.", line:156},
+        {t:"Stripe succeeds", d:"Single attempt, refund issued.", line:115},
+        {t:"Result", d:"Completed — refund_id and amount_cents returned to the customer.", line:170}
+      ]
+    },
+    notfound: {
+      label: "Order not found",
+      outcome: "warn",
+      nodes: ["n-start","n-ol","n-escalated"],
+      edges: ["e-start-ol","e-ol-escalated"],
+      steps: [
+        {t:"Order Lookup keeps failing", d:"3 attempts, each gated by an injection check and a rate-limit check first.", line:88},
+        {t:"Retries exhausted", d:"Never found — or the lookup itself kept erroring. Either way, this counts as “lookup didn't succeed,” not a crash.", line:112},
+        {t:"Result", d:"Escalated, never Failed — a flaky or missing order is a normal thing to hand to a human.", line:152}
+      ]
+    },
+    denied: {
+      label: "Policy denies it",
+      outcome: "warn",
+      nodes: ["n-start","n-ol","n-amount","n-policy","n-escalated"],
+      edges: ["e-start-ol","e-ol-amount","e-amount-policy","e-policy-escalated"],
+      steps: [
+        {t:"Order Lookup succeeds", d:"The order exists and is found normally.", line:88},
+        {t:"Amount resolves", d:"A requested amount is on the table.", line:138},
+        {t:"Policy fails one rule", d:"E.g. outside the 30-day return window, or the amount exceeds the order total.", line:156},
+        {t:"Result", d:"Escalated — the system never autonomously tells a customer no. A human makes that call.", line:158}
+      ]
+    },
+    stripefails: {
+      label: "Stripe call fails",
+      outcome: "warn",
+      nodes: ["n-start","n-ol","n-amount","n-policy","n-stripe","n-escalated"],
+      edges: ["e-start-ol","e-ol-amount","e-amount-policy","e-policy-stripe","e-stripe-escalated"],
+      steps: [
+        {t:"Order Lookup + Policy both pass", d:"Everything checks out up to this point.", line:156},
+        {t:"Stripe attempt fails", d:"A network error, an injection pattern in the customer's reason text, or a tripped rate limit.", line:115},
+        {t:"No retry", d:"Retrying a payment call after an ambiguous failure risks a real double-refund — there's no idempotency key yet to catch that (Stage 1.3).", line:121},
+        {t:"Result", d:"Escalated immediately, on the very first failure.", line:126}
+      ]
+    },
+    bug: {
+      label: "Unexpected bug",
+      outcome: "bad",
+      nodes: ["n-start","n-failed"],
+      edges: ["e-start-failed"],
+      steps: [
+        {t:"Something violates the contract", d:"E.g. evaluate_policy() claims compliant=True without a resolvable order or amount — that's not a real policy shape's job to produce.", line:160},
+        {t:"Caught, not crashed", d:"run() wraps its own resolution logic and turns any unexpected exception into a Failed value instead of raising.", line:190},
+        {t:"Result", d:"Failed — the one outcome that means “this is a bug,” turned into a real 502 by the API layer instead of a fake “under review” message.", line:170}
+      ]
+    }
+  };
+
+  var nodeDetail = {
+    start: {t:"New Request", d:"The single entry point: run(NewRequestInput(refund_request), rate_limiter, now). Everything below happens inside one call.", line:170},
+    ol: {t:"1 · Order Lookup", d:"Retried up to 3 times. Before every attempt: an injection-pattern check on the customer-supplied order_reference, then a rate-limit check — both gate the call, not just the outcome.", line:88},
+    amount: {t:"Resolve amount", d:"If the customer never stated an amount at intake, it resolves to the order's full amount before Policy ever sees it.", line:138},
+    policy: {t:"2 · Policy Check", d:"Four hardcoded rules today: order completed, inside the 30-day window, positive amount, not over the order total. Designed to be swapped for a real AI-driven check later behind this same function signature.", line:156},
+    stripe: {t:"3 · Stripe Refund", d:"Deliberately the one step with no retry loop. An ambiguous failure here (timeout on a charge that may have gone through) risks a real double-refund with no idempotency key yet to catch it.", line:115},
+    completed: {t:"✓ Completed", d:"refund_id and amount_cents are returned — the only outcome where money actually moved.", line:135},
+    escalated: {t:"⚠ Escalated", d:"Where almost every kind of trouble ends up: a flaky lookup, a denied policy check, a failed Stripe call. Handed to a human, never turned into an autonomous “no.”", line:82},
+    failed: {t:"✗ Failed", d:"Reserved for a genuine bug — something violating run()'s own contract — never for a normal tool failure. The API layer turns this into a real 502.", line:192}
+  };
+
+  var svg = document.querySelector("svg");
+  var panel = document.getElementById("panel");
+  var pills = document.querySelectorAll(".pill");
+  var allNodes = svg.querySelectorAll(".node");
+  var allEdges = svg.querySelectorAll(".edge");
+  var allLabels = svg.querySelectorAll(".edge-label");
+  var edgeToOutcome = {
+    "e-stripe-completed":"ok","e-ol-escalated":"warn","e-policy-escalated":"warn",
+    "e-stripe-escalated":"warn","e-start-failed":"bad"
+  };
+
+  function clearAll(){
+    allNodes.forEach(function(n){ n.classList.remove("is-active","is-dim"); });
+    allEdges.forEach(function(e){ e.classList.remove("is-active","is-dim","to-ok","to-warn","to-bad"); });
+    allLabels.forEach(function(l){ l.classList.remove("is-active","is-dim"); });
+    pills.forEach(function(p){ p.setAttribute("aria-pressed","false"); });
+  }
+
+  function codeLink(line){
+    return '<a href="' + REPO_BASE + '#L' + line + '" target="_blank" rel="noopener">agent_loop.py:' + line + '</a>';
+  }
+
+  function runScenario(key){
+    var sc = scenarios[key];
+    clearAll();
+    var activePill = document.querySelector('[data-scenario="' + key + '"]');
+    if(activePill) activePill.setAttribute("aria-pressed","true");
+
+    allNodes.forEach(function(n){
+      if(sc.nodes.indexOf(n.id) > -1){ n.classList.add("is-active"); }
+      else{ n.classList.add("is-dim"); }
+    });
+    allEdges.forEach(function(e){
+      if(sc.edges.indexOf(e.id) > -1){
+        e.classList.add("is-active");
+        var to = edgeToOutcome[e.id];
+        if(to) e.classList.add("to-" + to);
+      } else { e.classList.add("is-dim"); }
+    });
+    allLabels.forEach(function(l){
+      var edgeId = l.getAttribute("data-edge");
+      if(sc.edges.indexOf(edgeId) > -1){ l.classList.add("is-active"); }
+      else{ l.classList.add("is-dim"); }
+    });
+
+    var badgeClass = sc.outcome;
+    var badgeText = sc.outcome === "ok" ? "→ Completed" : (sc.outcome === "warn" ? "→ Escalated" : "→ Failed");
+    var html = '<h2>' + sc.label + '</h2>';
+    html += '<span class="outcome-badge ' + badgeClass + '">' + badgeText + '</span>';
+    html += '<ol class="steps">';
+    sc.steps.forEach(function(s){
+      html += '<li><strong>' + s.t + '</strong>' + s.d + ' &nbsp;' + codeLink(s.line) + '</li>';
+    });
+    html += '</ol>';
+    panel.innerHTML = html;
+  }
+
+  function showNode(key){
+    var d = nodeDetail[key];
+    if(!d) return;
+    clearAll();
+    var el = document.getElementById("n-" + key);
+    if(el) el.classList.add("is-active");
+    allNodes.forEach(function(n){ if(n !== el) n.classList.add("is-dim"); });
+    allEdges.forEach(function(e){ e.classList.add("is-dim"); });
+    allLabels.forEach(function(l){ l.classList.add("is-dim"); });
+
+    var html = '<h2>' + d.t + '</h2>';
+    html += '<div class="node-detail"><p>' + d.d + '</p>' + codeLink(d.line) + '</div>';
+    panel.innerHTML = html;
+  }
+
+  function reset(){
+    clearAll();
+    panel.innerHTML = '<h2>What’s happening</h2><div class="hint">Pick a scenario above to trace the exact path a request takes — or click any box in the diagram to read what that step does on its own.</div>';
+  }
+
+  pills.forEach(function(p){
+    p.addEventListener("click", function(){
+      var key = p.getAttribute("data-scenario");
+      if(key === "reset"){ reset(); return; }
+      runScenario(key);
+    });
+  });
+
+  allNodes.forEach(function(n){
+    var key = n.getAttribute("data-detail");
+    n.addEventListener("click", function(){ showNode(key); });
+    n.addEventListener("keydown", function(ev){
+      if(ev.key === "Enter" || ev.key === " "){ ev.preventDefault(); showNode(key); }
+    });
+  });
+})();
+</script>
+</body>
+</html>
