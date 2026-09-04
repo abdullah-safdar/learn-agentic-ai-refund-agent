@@ -85,6 +85,17 @@ def _escalated_for(refund_request: RefundRequest) -> Escalated:
     )
 
 
+def _idempotency_key_for(refund_request: RefundRequest) -> str:
+    """Deterministic Idempotency Key for the Stripe Refund Tool call,
+    derived from `refund_request.id` alone (never `Order` -- per AD-3, a
+    key derived from the shared Order would let one request's key block a
+    different, legitimate request against the same Order). Stable across
+    separate `_call_stripe()` invocations for the same RefundRequest, so a
+    crash-then-manual-replay or retried call within Stripe's
+    idempotency-key retention window is deduplicated by Stripe itself."""
+    return f"refund-request:{refund_request.id}"
+
+
 def _resolve_order(refund_request: RefundRequest, rate_limiter) -> tuple[bool, Optional[Order]]:
     """Order Lookup Tool: retried up to ORDER_LOOKUP_RETRY_CAP on failure.
     Returns (succeeded, order) -- succeeded=False means every attempt was
@@ -127,8 +138,14 @@ def _call_stripe(
     if not rate_limiter.allow("stripe_refund_tool"):
         return _escalated_for(refund_request)
 
+    idempotency_key = _idempotency_key_for(refund_request)
     try:
-        refund_id = stripe_refund.issue_refund(order=order, amount_cents=amount_cents, reason=refund_request.reason)
+        refund_id = stripe_refund.issue_refund(
+            order=order,
+            amount_cents=amount_cents,
+            reason=refund_request.reason,
+            idempotency_key=idempotency_key,
+        )
     except Exception:  # noqa: BLE001 -- any failure escalates immediately, never retried
         return _escalated_for(refund_request)
 

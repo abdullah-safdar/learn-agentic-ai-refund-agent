@@ -46,7 +46,7 @@ If you only think about "don't double-refund someone," you'd reach for an idempo
 So there are two separate layers:
 
 1. **Intake dedup** (built here, Stage 1.1) — before a `RefundRequest` row even gets created, check whether an equivalent one already exists (same order, same normalized reason, recent time window). See [`compute_dedup_key`](../../backend/services/intake.py#L66) and the check-then-create flow starting at [`submit_chat_message`](../../backend/services/intake.py#L91).
-2. **Idempotency key** — a second, independent safety net directly on the money-moving Stripe call. This is **Stage 1.3**, not built yet — don't go looking for it in the current code.
+2. **Idempotency key** — a second, independent safety net directly on the money-moving Stripe call. See [Stage 1.3](./story-1.3.md).
 
 One without the other leaves a real gap — which is exactly what an adversarial code review caught after the first implementation pass: a collision on the dedup key could return a *locally built* refund request instead of the one that actually got persisted. See the race-handling branch starting at [`services/intake.py:124`](../../backend/services/intake.py#L124) for the fix — it re-fetches and returns the row that actually won, never the one that got silently discarded.
 

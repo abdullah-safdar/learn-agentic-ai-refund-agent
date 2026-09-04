@@ -37,7 +37,7 @@ from models import (
 )
 from services import policy as policy_module
 from services import stripe_refund
-from services.agent_loop import ORDER_LOOKUP_RETRY_CAP, run
+from services.agent_loop import ORDER_LOOKUP_RETRY_CAP, _idempotency_key_for, run
 from services.policy import RETURN_WINDOW_DAYS
 
 FIXED_NOW = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
@@ -122,9 +122,11 @@ class FakeStripe:
         self._refund_id = refund_id
         self._should_raise = should_raise
         self.calls = 0
+        self.idempotency_keys: List[str] = []
 
-    def __call__(self, order: Order, amount_cents: int, reason: str) -> str:
+    def __call__(self, order: Order, amount_cents: int, reason: str, idempotency_key: str) -> str:
         self.calls += 1
+        self.idempotency_keys.append(idempotency_key)
         if self._should_raise:
             raise RuntimeError("simulated stripe failure")
         return self._refund_id
@@ -355,6 +357,69 @@ def test_unexpected_policy_failure_returns_failed_not_escalated(monkeypatch: pyt
     assert isinstance(result, Failed)
     assert result.reason
     assert stripe.calls == 0
+
+
+# --------------------------------------------------------------------------
+# Idempotency-key tests for the I/O & Edge-Case Matrix in
+# spec-1-3-duplicate-safe-refunds.md
+# --------------------------------------------------------------------------
+
+
+def test_idempotency_key_format_derived_from_refund_request_id() -> None:
+    refund_request = make_refund_request()
+
+    key = _idempotency_key_for(refund_request)
+
+    assert key == f"refund-request:{refund_request.id}"
+
+
+def test_same_refund_request_yields_same_idempotency_key_across_repeated_stripe_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same RefundRequest, Stripe call invoked twice (e.g. crash-then-manual
+    -replay of run()) -- the identical Idempotency Key must be sent both
+    times so Stripe recognizes the duplicate and does not issue a second
+    real refund."""
+    order = make_order()
+    stripe = FakeStripe(refund_id="re_dup")
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    refund_request = make_refund_request()
+
+    first = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+    second = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(first, Completed)
+    assert isinstance(second, Completed)
+    assert stripe.calls == 2
+    assert len(stripe.idempotency_keys) == 2
+    assert stripe.idempotency_keys[0] == stripe.idempotency_keys[1]
+    assert stripe.idempotency_keys[0] == f"refund-request:{refund_request.id}"
+
+
+def test_two_distinct_refund_requests_same_order_yield_different_idempotency_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two distinct RefundRequests against the same Order -- each derives
+    its key from its own id, so neither is blocked by the other's key."""
+    order = make_order(order_reference="ORD-SHARED")
+    stripe = FakeStripe(refund_id="re_shared")
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    first_request = make_refund_request(order_reference="ORD-SHARED")
+    second_request = make_refund_request(order_reference="ORD-SHARED")
+
+    first = run(NewRequestInput(refund_request=first_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+    second = run(NewRequestInput(refund_request=second_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(first, Completed)
+    assert isinstance(second, Completed)
+    assert stripe.calls == 2
+    assert stripe.idempotency_keys[0] != stripe.idempotency_keys[1]
+    assert stripe.idempotency_keys[0] == f"refund-request:{first_request.id}"
+    assert stripe.idempotency_keys[1] == f"refund-request:{second_request.id}"
 
 
 # --------------------------------------------------------------------------

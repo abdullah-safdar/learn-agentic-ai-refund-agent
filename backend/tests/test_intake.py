@@ -112,7 +112,7 @@ class FakeStripe:
         self._should_raise = should_raise
         self.calls = 0
 
-    def __call__(self, order: Order, amount_cents: int, reason: str) -> str:
+    def __call__(self, order: Order, amount_cents: int, reason: str, idempotency_key: str) -> str:
         self.calls += 1
         if self._should_raise:
             raise RuntimeError("simulated stripe failure")

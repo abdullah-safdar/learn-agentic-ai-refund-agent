@@ -32,7 +32,7 @@ Two things worth noticing in the shape of this diagram, not just its boxes: **`E
 
 ### 3. Stripe Refund — exactly once, never retried
 
-[`_call_stripe`](../../backend/services/agent_loop.py#L115) is the one step that's deliberately *not* covered by a retry loop. Retrying a payment call after an ambiguous failure (a timeout on a charge that may have actually succeeded) risks a real double-refund, and there's no idempotency key yet to catch that (that's [Stage 1.3](../planning/EPICS.md)). One attempt, and any failure — including another injection-pattern check, this time on the customer's `reason` text, since it flows into Stripe's request metadata — escalates immediately.
+[`_call_stripe`](../../backend/services/agent_loop.py#L115) is the one step that's deliberately *not* covered by a retry loop. Retrying a payment call after an ambiguous failure (a timeout on a charge that may have actually succeeded) risks a real double-refund, and there's no idempotency key yet to catch that (that's [Stage 1.3](./story-1.3.md)). One attempt, and any failure — including another injection-pattern check, this time on the customer's `reason` text, since it flows into Stripe's request metadata — escalates immediately.
 
 ## The non-obvious decision: `Failed` is not `Escalated`
 
@@ -47,4 +47,4 @@ pytest tests/test_agent_loop.py   # 21 tests - orchestration + the policy rule s
 
 ## Next stage
 
-Stage 1.3 (not yet built) adds the idempotency key — the second layer of duplicate-refund protection this page kept pointing at. See [Epics & Stories](../planning/EPICS.md) for the full planned sequence.
+[Stage 1.3](./story-1.3.md) adds the idempotency key — the second layer of duplicate-refund protection this page kept pointing at.
