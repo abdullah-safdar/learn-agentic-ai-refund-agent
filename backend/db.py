@@ -7,13 +7,15 @@ traffic, swap in a connection pool later if it ever needs to scale.
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
-from models import Order, RefundRequest
+from models import Order, RefundRequest, TrajectoryEvent
 
 CREATE_REFUND_REQUESTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS refund_requests (
@@ -43,6 +45,23 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS orders_order_reference_lower_idx
     ON orders (lower(order_reference));
+"""
+
+# AD-5: append-only, one row per major Agent Loop step, foreign-keyed to its
+# RefundRequest. sequence_no is domain-assigned (db.record_trajectory_event)
+# and transactionally unique per refund_request_id -- the UNIQUE constraint
+# is the backstop, not the primary mechanism (see record_trajectory_event's
+# docstring). No update/delete path exists anywhere in this module.
+CREATE_TRAJECTORY_EVENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS trajectory_events (
+    id UUID PRIMARY KEY,
+    refund_request_id UUID NOT NULL REFERENCES refund_requests(id),
+    sequence_no INTEGER NOT NULL,
+    step_type TEXT NOT NULL,
+    step_data JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (refund_request_id, sequence_no)
+);
 """
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
@@ -83,13 +102,26 @@ def _row_to_order(row: dict[str, Any]) -> Order:
     )
 
 
+def _row_to_trajectory_event(row: dict[str, Any]) -> TrajectoryEvent:
+    return TrajectoryEvent(
+        id=str(row["id"]),
+        refund_request_id=str(row["refund_request_id"]),
+        sequence_no=row["sequence_no"],
+        step_type=row["step_type"],
+        step_data=row["step_data"],
+        created_at=_to_iso8601_utc(row["created_at"]),
+    )
+
+
 def run_migrations() -> None:
-    """Create the refund_requests and orders tables if they don't already
-    exist. Idempotent -- safe to call on every startup."""
+    """Create the refund_requests, orders, and trajectory_events tables if
+    they don't already exist. Idempotent -- safe to call on every
+    startup."""
     with psycopg.connect(_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_REFUND_REQUESTS_TABLE_SQL)
             cur.execute(CREATE_ORDERS_TABLE_SQL)
+            cur.execute(CREATE_TRAJECTORY_EVENTS_TABLE_SQL)
         conn.commit()
 
 
@@ -158,6 +190,102 @@ def update_refund_status(refund_request_id: str, status: str) -> None:
                     f"refund_request_id={refund_request_id!r} -- expected exactly 1."
                 )
         conn.commit()
+
+
+def find_refund_request_by_id(refund_request_id: str) -> Optional[RefundRequest]:
+    """The RefundRequest with this id, or None if no such row exists --
+    including when `refund_request_id` isn't even a well-formed UUID.
+    Validated here in Python *before* ever touching Postgres, so the
+    trajectory endpoint's 404 path doesn't need to special-case malformed
+    path parameters -- and so a genuine data-layer error against a
+    well-formed UUID surfaces as a real error instead of being silently
+    swallowed into a 404 by a broad `except psycopg.errors.DataError`."""
+    try:
+        uuid.UUID(refund_request_id)
+    except ValueError:
+        return None
+    with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, order_reference, reason, amount_cents, status, created_at
+                FROM refund_requests
+                WHERE id = %s
+                """,
+                (refund_request_id,),
+            )
+            row = cur.fetchone()
+    return _row_to_refund_request(row) if row is not None else None
+
+
+def record_trajectory_event(
+    refund_request_id: str, step_type: str, step_data: dict[str, Any], now: datetime
+) -> TrajectoryEvent:
+    """Insert one immutable TrajectoryEvent row (AD-5). `step_data` must
+    already be the redacted, allowlisted dict for `step_type` -- built by
+    the caller (agent_loop.py); this function only persists it, never
+    shapes it.
+
+    `sequence_no` is assigned transactionally, in the same transaction as
+    the insert: `SELECT ... FOR UPDATE` locks this refund_request_id's
+    existing trajectory_events rows first, then `MAX(sequence_no) + 1` (or
+    `1` if none exist yet) is computed in Python. `UNIQUE(refund_request_id,
+    sequence_no)` is the backstop if this ever races -- Epic 1's loop runs
+    synchronously with a single writer per request, so this is
+    correctness-focused, not a throughput concern.
+    """
+    event_id = uuid.uuid4()
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT sequence_no
+                FROM trajectory_events
+                WHERE refund_request_id = %s
+                FOR UPDATE
+                """,
+                (refund_request_id,),
+            )
+            existing_sequence_nos = [row[0] for row in cur.fetchall()]
+            next_sequence_no = max(existing_sequence_nos, default=0) + 1
+            cur.execute(
+                """
+                INSERT INTO trajectory_events
+                    (id, refund_request_id, sequence_no, step_type, step_data, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (event_id, refund_request_id, next_sequence_no, step_type, Jsonb(step_data), now),
+            )
+        conn.commit()
+    return TrajectoryEvent(
+        id=str(event_id),
+        refund_request_id=refund_request_id,
+        sequence_no=next_sequence_no,
+        step_type=step_type,
+        step_data=step_data,
+        created_at=_to_iso8601_utc(now),
+    )
+
+
+def list_trajectory_events(refund_request_id: str) -> List[TrajectoryEvent]:
+    """Every TrajectoryEvent row for this refund_request_id, ordered by
+    sequence_no ascending -- the order the steps actually happened in. An
+    empty list means the RefundRequest exists but hasn't recorded any steps
+    yet (never used to mean "not found"; callers check that via
+    `find_refund_request_by_id` first)."""
+    with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, refund_request_id, sequence_no, step_type, step_data, created_at
+                FROM trajectory_events
+                WHERE refund_request_id = %s
+                ORDER BY sequence_no ASC
+                """,
+                (refund_request_id,),
+            )
+            rows = cur.fetchall()
+    return [_row_to_trajectory_event(row) for row in rows]
 
 
 def find_order_by_reference(order_reference: str) -> Optional[Order]:

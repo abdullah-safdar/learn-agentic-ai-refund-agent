@@ -248,12 +248,13 @@ export default function DashboardPage() {
                 <th>Amount</th>
                 <th>Status</th>
                 <th>Created</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
               {refundRequests.length === 0 && !isLoading && (
                 <tr>
-                  <td colSpan={5}>
+                  <td colSpan={6}>
                     <div className="empty-row">No refund requests yet -- submit one via the chat page.</div>
                   </td>
                 </tr>
@@ -267,6 +268,14 @@ export default function DashboardPage() {
                     <span className={`badge badge--${refundRequest.status}`}>{refundRequest.status}</span>
                   </td>
                   <td>{formatDate(refundRequest.created_at)}</td>
+                  <td>
+                    <button
+                      onClick={() => router.push(`/trajectory/${refundRequest.id}`)}
+                      className="btn btn-secondary btn-sm"
+                    >
+                      <span aria-hidden="true">🔍</span> Trajectory
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>

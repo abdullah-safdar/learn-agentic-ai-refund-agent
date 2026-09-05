@@ -18,14 +18,19 @@ Two groups of tests:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
 import db
 from models import (
     ORDER_STATUS_COMPLETED,
+    STEP_TYPE_ORDER_LOOKUP,
+    STEP_TYPE_OUTCOME,
+    STEP_TYPE_POLICY_DECISION,
+    STEP_TYPE_STRIPE_REFUND,
     Completed,
     Escalated,
     Failed,
@@ -34,6 +39,7 @@ from models import (
     PolicyDecision,
     RefundRequest,
     ResumeInput,
+    TrajectoryEvent,
 )
 from services import policy as policy_module
 from services import stripe_refund
@@ -41,6 +47,43 @@ from services.agent_loop import ORDER_LOOKUP_RETRY_CAP, _idempotency_key_for, ru
 from services.policy import RETURN_WINDOW_DAYS
 
 FIXED_NOW = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# Trajectory recording fake (spec-1-4-inspect-the-agents-reasoning.md) --
+# every test in this file runs the Agent Loop, which now writes
+# TrajectoryEvent rows via db.record_trajectory_event() at each step; this
+# autouse fixture stands in for the real (Postgres-backed) function so no
+# test needs a real database, and records calls in order so trajectory-
+# specific tests can assert against them.
+# --------------------------------------------------------------------------
+
+
+class FakeTrajectoryRecorder:
+    def __init__(self) -> None:
+        self.calls: List[Tuple[str, str, Dict[str, Any], datetime]] = []
+
+    def __call__(self, refund_request_id: str, step_type: str, step_data: Dict[str, Any], now: datetime) -> TrajectoryEvent:
+        self.calls.append((refund_request_id, step_type, step_data, now))
+        return TrajectoryEvent(
+            id=f"fake-event-{len(self.calls)}",
+            refund_request_id=refund_request_id,
+            sequence_no=len(self.calls),
+            step_type=step_type,
+            step_data=step_data,
+            created_at=now.isoformat(),
+        )
+
+    @property
+    def step_types(self) -> List[str]:
+        return [call[1] for call in self.calls]
+
+
+@pytest.fixture(autouse=True)
+def trajectory_recorder(monkeypatch: pytest.MonkeyPatch) -> FakeTrajectoryRecorder:
+    recorder = FakeTrajectoryRecorder()
+    monkeypatch.setattr(db, "record_trajectory_event", recorder)
+    return recorder
 
 
 # --------------------------------------------------------------------------
@@ -420,6 +463,247 @@ def test_two_distinct_refund_requests_same_order_yield_different_idempotency_key
     assert stripe.idempotency_keys[0] != stripe.idempotency_keys[1]
     assert stripe.idempotency_keys[0] == f"refund-request:{first_request.id}"
     assert stripe.idempotency_keys[1] == f"refund-request:{second_request.id}"
+
+
+# --------------------------------------------------------------------------
+# Trajectory-recording tests for the I/O & Edge-Case Matrix in
+# spec-1-4-inspect-the-agents-reasoning.md -- each asserts the recorded
+# step_type sequence and the redacted step_data for the step(s) that
+# matter, using the FakeTrajectoryRecorder installed above.
+# --------------------------------------------------------------------------
+
+
+def test_happy_path_records_order_lookup_policy_decision_stripe_refund_outcome_in_order(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    order = make_order(amount_cents=5000)
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe(refund_id="re_traj"))
+    refund_request = make_refund_request(amount_cents=1000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Completed)
+    assert trajectory_recorder.step_types == [
+        STEP_TYPE_ORDER_LOOKUP,
+        STEP_TYPE_POLICY_DECISION,
+        STEP_TYPE_STRIPE_REFUND,
+        STEP_TYPE_OUTCOME,
+    ]
+    # Every call was for this refund_request_id.
+    assert all(call[0] == refund_request.id for call in trajectory_recorder.calls)
+
+    order_lookup_data = trajectory_recorder.calls[0][2]
+    assert order_lookup_data == {"found": True, "retries_used": 0, "lookup_succeeded": True}
+
+    policy_decision_data = trajectory_recorder.calls[1][2]
+    assert policy_decision_data == {"compliant": True, "confidence": 1.0, "citation_ids": []}
+
+    stripe_refund_data = trajectory_recorder.calls[2][2]
+    assert stripe_refund_data == {"outcome": "completed", "refund_id": "re_traj", "amount_cents": 1000}
+
+    outcome_data = trajectory_recorder.calls[3][2]
+    assert outcome_data == {"status": "completed"}
+
+
+def test_order_lookup_retried_then_succeeds_records_retries_used_and_found_true(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    order = make_order()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order, fail_times=ORDER_LOOKUP_RETRY_CAP - 1))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe())
+    refund_request = make_refund_request()
+
+    run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    order_lookup_data = trajectory_recorder.calls[0][2]
+    assert order_lookup_data == {
+        "found": True,
+        "retries_used": ORDER_LOOKUP_RETRY_CAP - 1,
+        "lookup_succeeded": True,
+    }
+    assert order_lookup_data["retries_used"] > 0
+
+
+def test_order_lookup_retries_exhausted_records_only_order_lookup_and_outcome(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    monkeypatch.setattr(db, "find_order_by_reference", AlwaysRaisingOrderLookup())
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe())
+    refund_request = make_refund_request()
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert trajectory_recorder.step_types == [STEP_TYPE_ORDER_LOOKUP, STEP_TYPE_OUTCOME]
+    order_lookup_data = trajectory_recorder.calls[0][2]
+    assert order_lookup_data == {
+        "found": False,
+        "retries_used": ORDER_LOOKUP_RETRY_CAP - 1,
+        "lookup_succeeded": False,
+    }
+    outcome_data = trajectory_recorder.calls[1][2]
+    assert outcome_data == {"status": "escalated"}
+
+
+def test_non_compliant_policy_records_order_lookup_policy_decision_outcome_no_stripe_refund(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    order = make_order()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(NON_COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe())
+    refund_request = make_refund_request()
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert trajectory_recorder.step_types == [
+        STEP_TYPE_ORDER_LOOKUP,
+        STEP_TYPE_POLICY_DECISION,
+        STEP_TYPE_OUTCOME,
+    ]
+    policy_decision_data = trajectory_recorder.calls[1][2]
+    assert policy_decision_data["compliant"] is False
+
+
+def test_stripe_call_fails_records_stripe_refund_escalated_with_no_refund_id_then_outcome(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    order = make_order()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe(should_raise=True))
+    refund_request = make_refund_request()
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert trajectory_recorder.step_types == [
+        STEP_TYPE_ORDER_LOOKUP,
+        STEP_TYPE_POLICY_DECISION,
+        STEP_TYPE_STRIPE_REFUND,
+        STEP_TYPE_OUTCOME,
+    ]
+    stripe_refund_data = trajectory_recorder.calls[2][2]
+    assert stripe_refund_data == {"outcome": "escalated"}
+    assert "refund_id" not in stripe_refund_data
+    outcome_data = trajectory_recorder.calls[3][2]
+    assert outcome_data == {"status": "escalated"}
+
+
+def test_unexpected_policy_failure_records_outcome_failed_with_no_raw_exception_text(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=make_order()))
+    monkeypatch.setattr(policy_module, "evaluate_policy", raising_policy)
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe())
+    refund_request = make_refund_request()
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Failed)
+    assert trajectory_recorder.step_types == [STEP_TYPE_ORDER_LOOKUP, STEP_TYPE_OUTCOME]
+    outcome_data = trajectory_recorder.calls[-1][2]
+    assert outcome_data == {"status": "failed"}
+    # The raw exception message never lands in the stored step_data.
+    assert "simulated policy failure" not in str(outcome_data)
+
+
+def test_reason_never_appears_in_any_recorded_step_data(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    """The customer-supplied `reason` must never be written into a
+    TrajectoryEvent, however it resolves."""
+    order = make_order()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe(refund_id="re_secret_test"))
+    secret_reason = "super secret reason nobody should log verbatim -- ORD-SENTINEL-VALUE"
+    refund_request = make_refund_request(reason=secret_reason)
+
+    run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    for _refund_request_id, _step_type, step_data, _now in trajectory_recorder.calls:
+        assert secret_reason not in str(step_data)
+
+
+def _raising_trajectory_recorder(*_args, **_kwargs):
+    raise RuntimeError("simulated trajectory-write failure (e.g. a DB hiccup or sequence_no race)")
+
+
+def test_trajectory_write_failure_on_terminal_outcome_does_not_change_completed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising db.record_trajectory_event on the terminal `outcome` write
+    must not turn an already-Completed refund (Stripe already charged) into
+    a Failed result, and must not propagate out of run() -- spec-1-4's
+    review-loop-iteration-1 fix."""
+    order = make_order(amount_cents=5000)
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe(refund_id="re_survives_trajectory_failure"))
+    monkeypatch.setattr(db, "record_trajectory_event", _raising_trajectory_recorder)
+    refund_request = make_refund_request(amount_cents=1000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Completed)
+    assert result.refund_id == "re_survives_trajectory_failure"
+    assert result.amount_cents == 1000
+
+
+def test_trajectory_write_failure_on_stripe_refund_step_does_not_change_completed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same guarantee for an earlier step (stripe_refund, not just the
+    terminal outcome) -- every _record_step() call site is guarded, not
+    just the last one."""
+    order = make_order(amount_cents=3000)
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe(refund_id="re_earlier_step_failure"))
+    monkeypatch.setattr(db, "record_trajectory_event", _raising_trajectory_recorder)
+    refund_request = make_refund_request(amount_cents=3000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Completed)
+    assert result.refund_id == "re_earlier_step_failure"
+
+
+def test_trajectory_write_failure_never_propagates_out_of_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run() must never raise for a resolvable RunInput (Story 1.2's
+    pre-existing contract) -- a raising trajectory write must not be an
+    exception to that, for any AgentResult variant, including Escalated."""
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=None))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(NON_COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe())
+    monkeypatch.setattr(db, "record_trajectory_event", _raising_trajectory_recorder)
+    refund_request = make_refund_request()
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)  # not Failed -- the trajectory failure never leaked into the AgentResult
+
+
+def test_trajectory_write_failure_is_logged_at_warning_or_above(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    order = make_order()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", FakeStripe())
+    monkeypatch.setattr(db, "record_trajectory_event", _raising_trajectory_recorder)
+    refund_request = make_refund_request()
+
+    with caplog.at_level("WARNING", logger="services.agent_loop"):
+        run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
 # --------------------------------------------------------------------------

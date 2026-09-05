@@ -6,12 +6,20 @@ row via db.update_refund_status() after run() returns.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import db
 from models import (
+    STATUS_COMPLETED,
+    STATUS_ESCALATED,
+    STATUS_FAILED,
+    STEP_TYPE_ORDER_LOOKUP,
+    STEP_TYPE_OUTCOME,
+    STEP_TYPE_POLICY_DECISION,
+    STEP_TYPE_STRIPE_REFUND,
     AgentResult,
     Completed,
     Escalated,
@@ -23,6 +31,8 @@ from models import (
     RunInput,
 )
 from services import policy, stripe_refund
+
+logger = logging.getLogger(__name__)
 
 # Ask First: the Order Lookup Tool's retry/step cap has no confirmed value
 # anywhere else, so this picks a sensible default. The Stripe Refund Tool
@@ -85,6 +95,43 @@ def _escalated_for(refund_request: RefundRequest) -> Escalated:
     )
 
 
+def _record_step(refund_request_id: str, step_type: str, step_data: Dict[str, Any], now: datetime) -> None:
+    """Writes one TrajectoryEvent row for this Agent Loop step (AD-5). The
+    domain (this module) builds the already-redacted, allowlisted
+    `step_data` dict -- db.py only persists whatever it's handed, never
+    shapes it. Never passed a raw exception, Tool payload, or the
+    customer-supplied `reason`.
+
+    Trajectory writes must never affect the resolved AgentResult: a DB
+    hiccup or a sequence_no race (the UNIQUE-constraint backstop firing) is
+    logged and swallowed here, never propagated -- observability is
+    strictly secondary to the real business outcome (an already-Completed
+    refund, money already moved via Stripe, must never be turned into a
+    Failed response by a logging side-write). This is the only place that
+    guard lives; every call site below relies on it.
+    """
+    try:
+        db.record_trajectory_event(refund_request_id, step_type, step_data, now)
+    except Exception:  # noqa: BLE001 -- trajectory logging must never affect the AgentResult
+        logger.warning(
+            "Failed to record TrajectoryEvent for refund_request_id=%r step_type=%r step_data=%r",
+            refund_request_id,
+            step_type,
+            step_data,
+            exc_info=True,
+        )
+
+
+def _status_for(result: AgentResult) -> str:
+    if isinstance(result, Completed):
+        return STATUS_COMPLETED
+    if isinstance(result, Escalated):
+        return STATUS_ESCALATED
+    if isinstance(result, Failed):
+        return STATUS_FAILED
+    raise TypeError(f"Unhandled AgentResult variant: {type(result)!r}")
+
+
 def _idempotency_key_for(refund_request: RefundRequest) -> str:
     """Deterministic Idempotency Key for the Stripe Refund Tool call,
     derived from `refund_request.id` alone (never `Order` -- per AD-3, a
@@ -96,18 +143,23 @@ def _idempotency_key_for(refund_request: RefundRequest) -> str:
     return f"refund-request:{refund_request.id}"
 
 
-def _resolve_order(refund_request: RefundRequest, rate_limiter) -> tuple[bool, Optional[Order]]:
+def _resolve_order(refund_request: RefundRequest, rate_limiter) -> tuple[bool, Optional[Order], int]:
     """Order Lookup Tool: retried up to ORDER_LOOKUP_RETRY_CAP on failure.
-    Returns (succeeded, order) -- succeeded=False means every attempt was
-    rejected/failed and the retry cap was exhausted; the caller must
-    escalate, never treat this as Failed.
+    Returns (succeeded, order, attempts) -- succeeded=False means every
+    attempt was rejected/failed and the retry cap was exhausted; the caller
+    must escalate, never treat this as Failed. `attempts` is the number of
+    attempts actually made (including injection-blocked/rate-limited ones,
+    which still count toward the cap) -- the trajectory's `retries_used` is
+    `attempts - 1`.
 
     `rate_limiter` just needs an `.allow(key) -> bool` method -- any object
     with that shape works, no formal interface required (like passing any
     object satisfying a TypeScript structural type, minus the compiler
     check).
     """
+    attempts = 0
     for _ in range(ORDER_LOOKUP_RETRY_CAP):
+        attempts += 1
         if _matches_injection_pattern(refund_request.order_reference):
             # Tool call is never built; this attempt still counts toward
             # the retry cap.
@@ -118,9 +170,9 @@ def _resolve_order(refund_request: RefundRequest, rate_limiter) -> tuple[bool, O
             order = db.find_order_by_reference(refund_request.order_reference)
         except Exception:  # noqa: BLE001 -- any I/O failure is retryable here
             continue
-        return True, order
+        return True, order, attempts
 
-    return False, None
+    return False, None, attempts
 
 
 def _call_stripe(
@@ -164,13 +216,38 @@ def _resolve_requested_amount_cents(refund_request: RefundRequest, order: Option
 
 
 def _run_new_request(refund_request: RefundRequest, rate_limiter, now: datetime) -> AgentResult:
-    lookup_succeeded, order = _resolve_order(refund_request, rate_limiter)
+    lookup_succeeded, order, attempts = _resolve_order(refund_request, rate_limiter)
+    _record_step(
+        refund_request.id,
+        STEP_TYPE_ORDER_LOOKUP,
+        {
+            "found": lookup_succeeded and order is not None,
+            "retries_used": attempts - 1,
+            # Distinguishes "the Order Lookup Tool itself failed/was
+            # blocked and the retry cap was exhausted" from "the tool
+            # succeeded but genuinely found no matching order" -- both
+            # collapse to found=false, but they're different explanations
+            # for a debug trajectory to lose.
+            "lookup_succeeded": lookup_succeeded,
+        },
+        now,
+    )
     if not lookup_succeeded:
         return _escalated_for(refund_request)
 
     requested_amount_cents = _resolve_requested_amount_cents(refund_request, order)
 
     decision = policy.evaluate_policy(order, requested_amount_cents, now)
+    _record_step(
+        refund_request.id,
+        STEP_TYPE_POLICY_DECISION,
+        {
+            "compliant": decision.compliant,
+            "confidence": decision.confidence,
+            "citation_ids": decision.citation_ids,
+        },
+        now,
+    )
     if not decision.compliant:
         return _escalated_for(refund_request)
 
@@ -181,7 +258,21 @@ def _run_new_request(refund_request: RefundRequest, rate_limiter, now: datetime)
         # silently-wrong Completed/Escalated.
         raise AssertionError("evaluate_policy() returned compliant=True without a resolvable order/amount")
 
-    return _call_stripe(refund_request, order, requested_amount_cents, rate_limiter)
+    stripe_result = _call_stripe(refund_request, order, requested_amount_cents, rate_limiter)
+    if isinstance(stripe_result, Completed):
+        stripe_step_data: Dict[str, Any] = {
+            "outcome": "completed",
+            "refund_id": stripe_result.refund_id,
+            "amount_cents": stripe_result.amount_cents,
+        }
+    else:
+        # Injection-blocked, rate-limited, or a raised Stripe failure --
+        # never the raw exception or Stripe payload, only the fact that it
+        # escalated.
+        stripe_step_data = {"outcome": "escalated"}
+    _record_step(refund_request.id, STEP_TYPE_STRIPE_REFUND, stripe_step_data, now)
+
+    return stripe_result
 
 
 def run(input: RunInput, rate_limiter, now: Optional[datetime] = None) -> AgentResult:
@@ -205,6 +296,26 @@ def run(input: RunInput, rate_limiter, now: Optional[datetime] = None) -> AgentR
     current_time = now or datetime.now(timezone.utc)
 
     try:
-        return _run_new_request(input.refund_request, rate_limiter, current_time)
+        result: AgentResult = _run_new_request(input.refund_request, rate_limiter, current_time)
     except Exception as exc:  # noqa: BLE001 -- translate any unexpected failure to Failed
-        return Failed(reason=str(exc))
+        # Never the raw exception text -- the trajectory's terminal
+        # `outcome` step records only the resolved status, matching the
+        # "no raw exceptions" field allowlist.
+        result = Failed(reason=str(exc))
+
+    # Recorded before every return -- Completed/Escalated/Failed alike.
+    # The whole step (computing the status string via _status_for AND the
+    # _record_step call) is wrapped here, not just _record_step's own
+    # internal guard: _status_for raises TypeError for an AgentResult
+    # variant it doesn't recognize, which -- unreachable today, but a live
+    # landmine for a future variant -- must never propagate out of run()
+    # either. Nothing in outcome recording may affect the resolved result.
+    try:
+        _record_step(input.refund_request.id, STEP_TYPE_OUTCOME, {"status": _status_for(result)}, current_time)
+    except Exception:  # noqa: BLE001 -- outcome recording must never affect the resolved AgentResult
+        logger.warning(
+            "Failed to record terminal outcome TrajectoryEvent for refund_request_id=%r",
+            input.refund_request.id,
+            exc_info=True,
+        )
+    return result

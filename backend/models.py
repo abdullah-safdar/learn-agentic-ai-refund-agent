@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 STATUS_PENDING = "pending"
 STATUS_COMPLETED = "completed"
@@ -21,6 +21,14 @@ STATUS_ESCALATED = "escalated"
 STATUS_FAILED = "failed"
 
 ORDER_STATUS_COMPLETED = "completed"
+
+# TrajectoryEvent.step_type values -- one row per major Agent Loop step
+# (AD-5), never per retry. Order matches the sequence a NewRequestInput run
+# actually happened in when every step is reached.
+STEP_TYPE_ORDER_LOOKUP = "order_lookup"
+STEP_TYPE_POLICY_DECISION = "policy_decision"
+STEP_TYPE_STRIPE_REFUND = "stripe_refund"
+STEP_TYPE_OUTCOME = "outcome"
 
 
 def utc_now_iso8601() -> str:
@@ -81,6 +89,24 @@ class ExtractedRefundFields:
     order_reference: str
     reason: str
     amount_cents: Optional[int]
+
+
+@dataclass(frozen=True)
+class TrajectoryEvent:
+    """One immutable row in a RefundRequest's reasoning trajectory (AD-5) --
+    inserted by `db.record_trajectory_event()`, never updated or deleted.
+    `sequence_no` is domain-assigned, monotonic per `refund_request_id`
+    (never inferred from `created_at`). `step_data` holds only that
+    `step_type`'s allowlisted, redacted fields -- built by
+    `agent_loop._record_step()` -- never a raw Tool payload, exception, or
+    customer-supplied text."""
+
+    id: str
+    refund_request_id: str
+    sequence_no: int
+    step_type: str
+    step_data: Dict[str, Any]
+    created_at: str
 
 
 @dataclass(frozen=True)

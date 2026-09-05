@@ -27,4 +27,4 @@ pytest tests/test_agent_loop.py tests/test_stripe_refund.py   # 26 tests -- orch
 
 ## Next stage
 
-Stage 1.4 (not yet built) makes the Agent Loop's reasoning inspectable — a trajectory log of every step it took. See [Epics & Stories](../planning/EPICS.md) for the full planned sequence.
+[Stage 1.4](./story-1.4.md) makes the Agent Loop's reasoning inspectable — a trajectory log of every step it took.

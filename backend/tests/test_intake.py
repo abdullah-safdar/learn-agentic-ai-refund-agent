@@ -41,6 +41,7 @@ from models import (
     IntakeResult,
     Order,
     RefundRequest,
+    TrajectoryEvent,
 )
 from rate_limit import InMemoryRateLimiter
 
@@ -117,6 +118,26 @@ class FakeStripe:
         if self._should_raise:
             raise RuntimeError("simulated stripe failure")
         return self._refund_id
+
+
+def install_fake_trajectory_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Agent Loop now writes TrajectoryEvent rows at each step
+    (spec-1-4-inspect-the-agents-reasoning.md) -- these API-level tests
+    exercise the full chat -> Agent Loop path, so db.record_trajectory_event
+    must be stubbed the same way every other db.py write is here (no real
+    Postgres calls in this file)."""
+
+    def _fake_record(refund_request_id: str, step_type: str, step_data, now) -> TrajectoryEvent:
+        return TrajectoryEvent(
+            id="fake-event-id",
+            refund_request_id=refund_request_id,
+            sequence_no=1,
+            step_type=step_type,
+            step_data=step_data,
+            created_at=now.isoformat(),
+        )
+
+    monkeypatch.setattr(db, "record_trajectory_event", _fake_record)
 
 
 def raising_policy(order, requested_amount_cents, now):
@@ -297,6 +318,7 @@ def _build_test_app(
         )
 
     install_repo(monkeypatch, repo or FakeRepo())
+    install_fake_trajectory_recorder(monkeypatch)
 
     # Defaults: no matching order, the real (pure-logic, no-I/O) hardcoded
     # policy function, and a Stripe fake that must never actually be called
