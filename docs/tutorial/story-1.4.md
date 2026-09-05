@@ -80,4 +80,4 @@ curl http://localhost:8000/api/refund-requests/<id>/trajectory
 
 ## Next stage
 
-Stage 1.5 (not yet built) adds a real Escalation Threshold and Confidence Score, so the agent decides *when* to hand a request to a human instead of guessing. See [Epics & Stories](../planning/EPICS.md) for the full planned sequence.
+[Stage 1.5](./story-1.5.md) adds a real Escalation Threshold and Confidence Score, so the agent decides *when* to hand a request to a human instead of guessing.

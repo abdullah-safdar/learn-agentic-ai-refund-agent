@@ -19,6 +19,7 @@ This project is built as one evolving feature — a Stripe-backed customer refun
 | 1.2 | [`story-1.2-agent-loop`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-1.2-agent-loop) | Order lookup, policy check, and a real Stripe refund — the Agent Loop resolves clear-cut requests end-to-end | [story-1.2.md](./story-1.2.md) |
 | 1.3 | [`story-1.3-idempotency-key`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-1.3-idempotency-key) | A per-request Stripe Idempotency Key closes the second duplicate-refund protection layer | [story-1.3.md](./story-1.3.md) |
 | 1.4 | [`story-1.4-trajectory`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-1.4-trajectory) | An append-only Trajectory log makes the Agent Loop's reasoning inspectable, via a debug endpoint and a small viewer page | [story-1.4.md](./story-1.4.md) |
+| 1.5 | [`story-1.5-escalation-threshold`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-1.5-escalation-threshold) | A versioned Escalation Threshold makes the agent escalate large or low-confidence refunds instead of auto-approving them | [story-1.5.md](./story-1.5.md) |
 
 \* This tag reflects the project's original hexagonal (ports & adapters) implementation. The backend was later flattened for teaching clarity — see the "Why this doesn't look hexagonal anymore" section at the top of [story-1.1.md](./story-1.1.md) for why, and what changed. Story 1.1's actual behavior is unchanged; only its internal code structure is.
 
