@@ -33,6 +33,7 @@ from models import (
     STEP_TYPE_STRIPE_REFUND,
     Completed,
     Escalated,
+    EscalationThreshold,
     Failed,
     NewRequestInput,
     Order,
@@ -84,6 +85,41 @@ def trajectory_recorder(monkeypatch: pytest.MonkeyPatch) -> FakeTrajectoryRecord
     recorder = FakeTrajectoryRecorder()
     monkeypatch.setattr(db, "record_trajectory_event", recorder)
     return recorder
+
+
+# --------------------------------------------------------------------------
+# Escalation Threshold fake (spec-1-5-escalate-when-uncertain.md) -- every
+# test in this file that reaches the compliant-decision branch now also
+# reads db.get_current_escalation_threshold() before the Stripe call. This
+# autouse default stands in for the real (Postgres-backed) function with a
+# threshold every pre-existing test's amounts/confidences fall comfortably
+# below/above (so they proceed to Stripe exactly as before spec-1-5);
+# escalation-threshold-specific tests below monkeypatch over this default
+# themselves.
+# --------------------------------------------------------------------------
+
+
+def make_escalation_threshold(
+    confidence_threshold: float = 0.7,
+    dollar_threshold_cents: int = 50000,
+) -> EscalationThreshold:
+    return EscalationThreshold(
+        confidence_threshold=confidence_threshold,
+        dollar_threshold_cents=dollar_threshold_cents,
+        effective_at=FIXED_NOW.isoformat().replace("+00:00", "Z"),
+        changed_by="system:migration-seed",
+    )
+
+
+def raising_escalation_threshold(now: datetime) -> EscalationThreshold:
+    raise RuntimeError("simulated escalation-threshold read failure")
+
+
+@pytest.fixture(autouse=True)
+def default_escalation_threshold(monkeypatch: pytest.MonkeyPatch) -> EscalationThreshold:
+    threshold = make_escalation_threshold()
+    monkeypatch.setattr(db, "get_current_escalation_threshold", lambda now: threshold)
+    return threshold
 
 
 # --------------------------------------------------------------------------
@@ -400,6 +436,108 @@ def test_unexpected_policy_failure_returns_failed_not_escalated(monkeypatch: pyt
     assert isinstance(result, Failed)
     assert result.reason
     assert stripe.calls == 0
+
+
+# --------------------------------------------------------------------------
+# Escalation Threshold tests for the I/O & Edge-Case Matrix in
+# spec-1-5-escalate-when-uncertain.md -- AD-9's versioned threshold read,
+# monkeypatched here the same way find_order_by_reference is faked above.
+# --------------------------------------------------------------------------
+
+
+def test_amount_at_dollar_threshold_escalates_without_calling_stripe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inclusive boundary: amount_cents == dollar_threshold_cents."""
+    order = make_order(amount_cents=50000)
+    stripe = FakeStripe()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    monkeypatch.setattr(db, "get_current_escalation_threshold", lambda now: make_escalation_threshold(dollar_threshold_cents=50000))
+    refund_request = make_refund_request(amount_cents=50000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert stripe.calls == 0
+
+
+def test_amount_above_dollar_threshold_escalates_regardless_of_confidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dollar cutoff always wins -- confidence=1.0 (maximal) still
+    escalates once the amount clears the threshold."""
+    order = make_order(amount_cents=100000)
+    stripe = FakeStripe()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    monkeypatch.setattr(db, "get_current_escalation_threshold", lambda now: make_escalation_threshold(dollar_threshold_cents=50000))
+    refund_request = make_refund_request(amount_cents=60000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert stripe.calls == 0
+
+
+def test_confidence_below_threshold_escalates_without_calling_stripe(monkeypatch: pytest.MonkeyPatch) -> None:
+    order = make_order(amount_cents=1000)
+    stripe = FakeStripe()
+    low_confidence_decision = PolicyDecision(compliant=True, confidence=0.5, citation_ids=[])
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(low_confidence_decision))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    monkeypatch.setattr(db, "get_current_escalation_threshold", lambda now: make_escalation_threshold(confidence_threshold=0.7))
+    refund_request = make_refund_request(amount_cents=1000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert stripe.calls == 0
+
+
+def test_amount_below_dollar_threshold_and_confidence_at_threshold_still_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: both checks passing (amount strictly below the dollar
+    cutoff, confidence at-or-above the confidence cutoff) proceeds to
+    Stripe exactly as before this story."""
+    order = make_order(amount_cents=1000)
+    stripe = FakeStripe(refund_id="re_below_both")
+    at_threshold_decision = PolicyDecision(compliant=True, confidence=0.7, citation_ids=[])
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(at_threshold_decision))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    monkeypatch.setattr(
+        db,
+        "get_current_escalation_threshold",
+        lambda now: make_escalation_threshold(confidence_threshold=0.7, dollar_threshold_cents=50000),
+    )
+    refund_request = make_refund_request(amount_cents=1000)
+
+    result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Completed)
+    assert stripe.calls == 1
+
+
+def test_escalation_threshold_read_failure_escalates_never_failed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unreadable threshold must escalate, never surface as Failed and
+    never fall through to auto-approval, logged at WARNING."""
+    order = make_order(amount_cents=1000)
+    stripe = FakeStripe()
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(policy_module, "evaluate_policy", FakePolicy(COMPLIANT_DECISION))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+    monkeypatch.setattr(db, "get_current_escalation_threshold", raising_escalation_threshold)
+    refund_request = make_refund_request(amount_cents=1000)
+
+    with caplog.at_level("WARNING", logger="services.agent_loop"):
+        result = run(NewRequestInput(refund_request=refund_request), rate_limiter=AlwaysAllowRateLimiter(), now=FIXED_NOW)
+
+    assert isinstance(result, Escalated)
+    assert stripe.calls == 0
+    assert any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
 # --------------------------------------------------------------------------

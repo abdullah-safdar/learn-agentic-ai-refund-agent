@@ -110,6 +110,20 @@ class TrajectoryEvent:
 
 
 @dataclass(frozen=True)
+class EscalationThreshold:
+    """One versioned/audited row from the `escalation_thresholds` table
+    (AD-9) -- insert-only, never updated in place. `db.get_current_escalation_threshold()`
+    resolves whichever row is currently in effect (latest `effective_at <=
+    now`); a future admin story can add a write path against this same
+    table, but this story only reads it."""
+
+    confidence_threshold: float
+    dollar_threshold_cents: int
+    effective_at: str
+    changed_by: str
+
+
+@dataclass(frozen=True)
 class PolicyDecision:
     """What `policy.evaluate_policy()` returns -- a fixed shape regardless
     of how the decision was actually made (today: hardcoded rules; a later

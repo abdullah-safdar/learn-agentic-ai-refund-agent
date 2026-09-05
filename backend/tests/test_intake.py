@@ -37,6 +37,7 @@ from services import intake, llm, policy, stripe_refund
 from models import (
     ORDER_STATUS_COMPLETED,
     ClarificationNeeded,
+    EscalationThreshold,
     ExtractedRefundFields,
     IntakeResult,
     Order,
@@ -138,6 +139,25 @@ def install_fake_trajectory_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(db, "record_trajectory_event", _fake_record)
+
+
+_DEFAULT_PASSING_ESCALATION_THRESHOLD = EscalationThreshold(
+    confidence_threshold=0.7,
+    dollar_threshold_cents=50000,
+    effective_at=FIXED_NOW.isoformat().replace("+00:00", "Z"),
+    changed_by="system:migration-seed",
+)
+
+
+def install_default_escalation_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Agent Loop now reads db.get_current_escalation_threshold()
+    before the Stripe call (spec-1-5-escalate-when-uncertain.md) -- these
+    API-level tests exercise the full chat -> Agent Loop path and predate
+    that check, so this default (every amount here is well below the
+    dollar cutoff, and the hardcoded policy always returns confidence=1.0)
+    keeps them resolving to Completed exactly as before. The escalation
+    threshold's own behavior is covered by tests/test_agent_loop.py."""
+    monkeypatch.setattr(db, "get_current_escalation_threshold", lambda now: _DEFAULT_PASSING_ESCALATION_THRESHOLD)
 
 
 def raising_policy(order, requested_amount_cents, now):
@@ -319,6 +339,7 @@ def _build_test_app(
 
     install_repo(monkeypatch, repo or FakeRepo())
     install_fake_trajectory_recorder(monkeypatch)
+    install_default_escalation_threshold(monkeypatch)
 
     # Defaults: no matching order, the real (pure-logic, no-I/O) hardcoded
     # policy function, and a Stripe fake that must never actually be called

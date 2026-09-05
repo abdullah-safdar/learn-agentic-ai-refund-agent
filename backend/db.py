@@ -15,7 +15,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from models import Order, RefundRequest, TrajectoryEvent
+from models import EscalationThreshold, Order, RefundRequest, TrajectoryEvent
 
 CREATE_REFUND_REQUESTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS refund_requests (
@@ -63,6 +63,26 @@ CREATE TABLE IF NOT EXISTS trajectory_events (
     UNIQUE (refund_request_id, sequence_no)
 );
 """
+
+# AD-9: insert-only, versioned/audited by (effective_at, changed_by) --
+# never updated in place. No admin endpoint/UI writes this table this
+# story (Ask First / Never); seeded once by run_migrations() below, same
+# out-of-band-seeding precedent as the orders table.
+CREATE_ESCALATION_THRESHOLDS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS escalation_thresholds (
+    id UUID PRIMARY KEY,
+    confidence_threshold DOUBLE PRECISION NOT NULL,
+    dollar_threshold_cents BIGINT NOT NULL,
+    effective_at TIMESTAMPTZ NOT NULL,
+    changed_by TEXT NOT NULL
+);
+"""
+
+# Ask First: seed values -- confidence_threshold=0.7, dollar_threshold_cents
+# =50000 ($500.00) -- flagged in the spec as the proposed defaults.
+DEFAULT_ESCALATION_CONFIDENCE_THRESHOLD = 0.7
+DEFAULT_ESCALATION_DOLLAR_THRESHOLD_CENTS = 50000
+DEFAULT_ESCALATION_CHANGED_BY = "system:migration-seed"
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 
@@ -113,15 +133,49 @@ def _row_to_trajectory_event(row: dict[str, Any]) -> TrajectoryEvent:
     )
 
 
+def _row_to_escalation_threshold(row: dict[str, Any]) -> EscalationThreshold:
+    return EscalationThreshold(
+        confidence_threshold=row["confidence_threshold"],
+        dollar_threshold_cents=row["dollar_threshold_cents"],
+        effective_at=_to_iso8601_utc(row["effective_at"]),
+        changed_by=row["changed_by"],
+    )
+
+
 def run_migrations() -> None:
-    """Create the refund_requests, orders, and trajectory_events tables if
-    they don't already exist. Idempotent -- safe to call on every
-    startup."""
+    """Create the refund_requests, orders, trajectory_events, and
+    escalation_thresholds tables if they don't already exist. Idempotent --
+    safe to call on every startup.
+
+    escalation_thresholds also gets one default row seeded here (and only
+    here -- there's no admin write path this story) if the table is
+    currently empty, so `get_current_escalation_threshold()` always has a
+    row to resolve on a fresh database. The seed insert's own `WHERE NOT
+    EXISTS` is the atomic guard -- two app instances racing this same
+    migration against a freshly-created, empty table must never both
+    insert a default row, and a separate `SELECT COUNT(*)` check beforehand
+    would not be atomic with the insert that follows it.
+    """
     with psycopg.connect(_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_REFUND_REQUESTS_TABLE_SQL)
             cur.execute(CREATE_ORDERS_TABLE_SQL)
             cur.execute(CREATE_TRAJECTORY_EVENTS_TABLE_SQL)
+            cur.execute(CREATE_ESCALATION_THRESHOLDS_TABLE_SQL)
+            cur.execute(
+                """
+                INSERT INTO escalation_thresholds
+                    (id, confidence_threshold, dollar_threshold_cents, effective_at, changed_by)
+                SELECT %s, %s, %s, now(), %s
+                WHERE NOT EXISTS (SELECT 1 FROM escalation_thresholds)
+                """,
+                (
+                    uuid.uuid4(),
+                    DEFAULT_ESCALATION_CONFIDENCE_THRESHOLD,
+                    DEFAULT_ESCALATION_DOLLAR_THRESHOLD_CENTS,
+                    DEFAULT_ESCALATION_CHANGED_BY,
+                ),
+            )
         conn.commit()
 
 
@@ -312,3 +366,44 @@ def find_order_by_reference(order_reference: str) -> Optional[Order]:
             )
             row = cur.fetchone()
     return _row_to_order(row) if row is not None else None
+
+
+def get_current_escalation_threshold(now: datetime) -> EscalationThreshold:
+    """The EscalationThreshold row currently in effect (AD-9): the latest
+    `effective_at <= now`, per the append-only versioning scheme. `now` is
+    threaded in explicitly by the caller (like `record_trajectory_event`'s
+    own `now` parameter above) rather than read from Postgres's wall clock,
+    for the same determinism every other time-sensitive call in this module
+    already relies on. `id DESC` is a stable secondary sort key, breaking
+    ties deterministically on the rare chance two rows ever share the exact
+    same `effective_at`. Raises (never returns a sentinel) both on a
+    genuine I/O failure and if the table is unexpectedly empty (it should
+    always hold at least the default row seeded by run_migrations()) --
+    callers (agent_loop.py) must treat any raise here as "unreadable
+    threshold", which the spec requires to escalate, never fall through to
+    auto-approval.
+    """
+    with psycopg.connect(
+        _dsn(),
+        row_factory=dict_row,
+        connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        options=f"-c statement_timeout={int(DEFAULT_CONNECT_TIMEOUT_SECONDS * 1000)}",
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, confidence_threshold, dollar_threshold_cents, effective_at, changed_by
+                FROM escalation_thresholds
+                WHERE effective_at <= %s
+                ORDER BY effective_at DESC, id DESC
+                LIMIT 1
+                """,
+                (now,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(
+            "No escalation_thresholds row is currently in effect -- "
+            "table should have been seeded by run_migrations()."
+        )
+    return _row_to_escalation_threshold(row)

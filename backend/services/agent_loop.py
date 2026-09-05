@@ -258,6 +258,29 @@ def _run_new_request(refund_request: RefundRequest, rate_limiter, now: datetime)
         # silently-wrong Completed/Escalated.
         raise AssertionError("evaluate_policy() returned compliant=True without a resolvable order/amount")
 
+    try:
+        threshold = db.get_current_escalation_threshold(now)
+    except Exception:  # noqa: BLE001 -- an unreadable threshold must escalate, never fall through to auto-approval
+        logger.warning(
+            "Failed to read EscalationThreshold for refund_request_id=%r -- escalating",
+            refund_request.id,
+            exc_info=True,
+        )
+        return _escalated_for(refund_request)
+
+    # AD-9: the dollar cutoff is inclusive (`>=`) and always wins regardless
+    # of confidence; a low Confidence Score (AD-8, reused from PolicyDecision
+    # -- no new LLM-judge call) escalates independently. Either condition on
+    # its own is enough. The confidence check is intentionally exclusive at
+    # the boundary (`<`, not `<=`) -- confidence exactly equal to the
+    # threshold does NOT escalate, matching the epic AC's "falls below"
+    # wording, as distinct from the dollar side's "at or above".
+    if (
+        requested_amount_cents >= threshold.dollar_threshold_cents
+        or decision.confidence < threshold.confidence_threshold
+    ):
+        return _escalated_for(refund_request)
+
     stripe_result = _call_stripe(refund_request, order, requested_amount_cents, rate_limiter)
     if isinstance(stripe_result, Completed):
         stripe_step_data: Dict[str, Any] = {
