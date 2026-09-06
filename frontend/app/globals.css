@@ -434,6 +434,16 @@ table.data-table {
   color: var(--danger);
 }
 
+.badge--denied {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.badge--approved {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
 /* Chat */
 
 .chat-card {

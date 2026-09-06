@@ -30,8 +30,10 @@ from models import (
     STEP_TYPE_ORDER_LOOKUP,
     STEP_TYPE_OUTCOME,
     STEP_TYPE_POLICY_DECISION,
+    STEP_TYPE_REVIEWER_DECISION,
     STEP_TYPE_STRIPE_REFUND,
     Completed,
+    Denied,
     Escalated,
     EscalationThreshold,
     Failed,
@@ -412,16 +414,275 @@ def test_stripe_rate_limit_denied_escalates_without_calling_stripe(monkeypatch: 
     assert stripe.calls == 0
 
 
-def test_resume_input_is_not_yet_implemented() -> None:
-    """ResumeInput exists in the RunInput type already, but nothing handles
-    one yet -- run() must not silently mishandle it as if it were a
-    NewRequestInput."""
-    with pytest.raises(NotImplementedError):
-        run(
-            ResumeInput(refund_request_id="some-id", reviewer_decision="approve"),
-            rate_limiter=AlwaysAllowRateLimiter(),
-            now=FIXED_NOW,
-        )
+def test_resume_approve_completes_via_order_lookup_and_stripe_no_policy_check(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    """Approve resumes through the same _resolve_order/_call_stripe path
+    _run_new_request uses -- but never re-runs evaluate_policy() or the
+    Escalation Threshold check (a human already overrode those)."""
+    refund_request = make_refund_request(amount_cents=1000)
+    order = make_order(amount_cents=1000)
+    order_lookup = FakeOrderLookup(order=order)
+    stripe = FakeStripe(refund_id="re_resume_ok")
+    policy = FakePolicy(COMPLIANT_DECISION)
+    monkeypatch.setattr(db, "find_refund_request_by_id", lambda rrid: refund_request if rrid == refund_request.id else None)
+    monkeypatch.setattr(db, "find_order_by_reference", order_lookup)
+    monkeypatch.setattr(policy_module, "evaluate_policy", policy)
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+
+    result = run(
+        ResumeInput(refund_request_id=refund_request.id, reviewer_decision="approve", reviewer_identifier="staff@example.com"),
+        rate_limiter=AlwaysAllowRateLimiter(),
+        now=FIXED_NOW,
+    )
+
+    assert isinstance(result, Completed)
+    assert result.refund_id == "re_resume_ok"
+    assert result.amount_cents == 1000
+    assert order_lookup.calls == 1
+    assert stripe.calls == 1
+    assert len(policy.calls) == 0  # never re-run on resume
+
+    assert trajectory_recorder.step_types == [
+        STEP_TYPE_REVIEWER_DECISION,
+        STEP_TYPE_ORDER_LOOKUP,
+        STEP_TYPE_STRIPE_REFUND,
+        STEP_TYPE_OUTCOME,
+    ]
+    reviewer_decision_data = trajectory_recorder.calls[0][2]
+    assert reviewer_decision_data == {"decision": "approve", "reviewer_identifier": "staff@example.com"}
+    outcome_data = trajectory_recorder.calls[-1][2]
+    assert outcome_data == {"status": "completed"}
+
+
+def test_resume_approve_order_lookup_exhausted_re_escalates_never_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    refund_request = make_refund_request()
+    order_lookup = AlwaysRaisingOrderLookup()
+    stripe = FakeStripe()
+    monkeypatch.setattr(db, "find_refund_request_by_id", lambda rrid: refund_request)
+    monkeypatch.setattr(db, "find_order_by_reference", order_lookup)
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+
+    result = run(
+        ResumeInput(refund_request_id=refund_request.id, reviewer_decision="approve", reviewer_identifier="staff@example.com"),
+        rate_limiter=AlwaysAllowRateLimiter(),
+        now=FIXED_NOW,
+    )
+
+    assert isinstance(result, Escalated)
+    assert result.pending_review_id == refund_request.id
+    assert order_lookup.calls == ORDER_LOOKUP_RETRY_CAP
+    assert stripe.calls == 0
+
+
+def test_resume_approve_order_not_found_escalates_without_calling_stripe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lookup succeeds but genuinely finds no order -- no policy check to
+    fall back on here, so this escalates rather than raising."""
+    refund_request = make_refund_request()
+    stripe = FakeStripe()
+    monkeypatch.setattr(db, "find_refund_request_by_id", lambda rrid: refund_request)
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=None))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+
+    result = run(
+        ResumeInput(refund_request_id=refund_request.id, reviewer_decision="approve", reviewer_identifier="staff@example.com"),
+        rate_limiter=AlwaysAllowRateLimiter(),
+        now=FIXED_NOW,
+    )
+
+    assert isinstance(result, Escalated)
+    assert stripe.calls == 0
+
+
+def test_resume_approve_stripe_failure_re_escalates_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    refund_request = make_refund_request()
+    order = make_order()
+    stripe = FakeStripe(should_raise=True)
+    monkeypatch.setattr(db, "find_refund_request_by_id", lambda rrid: refund_request)
+    monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+
+    result = run(
+        ResumeInput(refund_request_id=refund_request.id, reviewer_decision="approve", reviewer_identifier="staff@example.com"),
+        rate_limiter=AlwaysAllowRateLimiter(),
+        now=FIXED_NOW,
+    )
+
+    assert isinstance(result, Escalated)
+    assert stripe.calls == 1  # exactly one attempt, never retried
+
+
+def test_resume_deny_returns_denied_without_calling_order_lookup_or_stripe(
+    monkeypatch: pytest.MonkeyPatch, trajectory_recorder: FakeTrajectoryRecorder
+) -> None:
+    refund_request = make_refund_request()
+    order_lookup = FakeOrderLookup(order=make_order())
+    stripe = FakeStripe()
+    monkeypatch.setattr(db, "find_refund_request_by_id", lambda rrid: refund_request)
+    monkeypatch.setattr(db, "find_order_by_reference", order_lookup)
+    monkeypatch.setattr(stripe_refund, "issue_refund", stripe)
+
+    result = run(
+        ResumeInput(refund_request_id=refund_request.id, reviewer_decision="deny", reviewer_identifier="staff@example.com"),
+        rate_limiter=AlwaysAllowRateLimiter(),
+        now=FIXED_NOW,
+    )
+
+    assert isinstance(result, Denied)
+    assert result.refund_request_id == refund_request.id
+    assert order_lookup.calls == 0
+    assert stripe.calls == 0
+    assert trajectory_recorder.step_types == [STEP_TYPE_REVIEWER_DECISION, STEP_TYPE_OUTCOME]
+    outcome_data = trajectory_recorder.calls[-1][2]
+    assert outcome_data == {"status": "denied"}
+
+
+def test_resume_with_unrecognized_reviewer_decision_value_returns_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defense-in-depth at the domain boundary: run() never lets an
+    unrecognized reviewer_decision silently fall through to the deny/
+    Denied path -- _resume_request raises ValueError, which run()'s own
+    try/except then surfaces as Failed, same as any other unexpected
+    failure."""
+    refund_request = make_refund_request()
+    monkeypatch.setattr(db, "find_refund_request_by_id", lambda rrid: refund_request)
+
+    result = run(
+        ResumeInput(refund_request_id=refund_request.id, reviewer_decision="maybe", reviewer_identifier="staff@example.com"),
+        rate_limiter=AlwaysAllowRateLimiter(),
+        now=FIXED_NOW,
+    )
+
+    assert isinstance(result, Failed)
+
+
+# --------------------------------------------------------------------------
+# db.record_reviewer_decision() atomicity tests for the I/O & Edge-Case
+# Matrix's "Double decision (race)" row -- a fake psycopg connection/cursor
+# stands in for Postgres so the rowcount-guard logic itself (not a real
+# database) is what's under test. No other test in this suite touches
+# psycopg directly; every other db.py function is monkeypatched wholesale
+# at its own boundary instead, but record_reviewer_decision()'s atomicity
+# *is* the behavior spec-1-6 introduces, so it's worth exercising directly.
+# --------------------------------------------------------------------------
+
+
+class FakeDecisionCursor:
+    def __init__(self, update_rowcount: int) -> None:
+        self._update_rowcount = update_rowcount
+        self.rowcount = 0
+        self.queries: List[str] = []
+        # (normalized_sql, params) for every execute() call, in order --
+        # lets tests assert on the actual bound values, not just which
+        # statement ran (a swapped STATUS_APPROVED/STATUS_DENIED, or the
+        # wrong refund_request_id/STATUS_ESCALATED guard value in the
+        # UPDATE's WHERE clause, would only be caught by checking these).
+        self.calls: List[Tuple[str, Optional[tuple]]] = []
+
+    def execute(self, sql: str, params: Optional[tuple] = None) -> None:
+        normalized = " ".join(sql.split())
+        self.queries.append(normalized)
+        self.calls.append((normalized, params))
+        if normalized.startswith("UPDATE"):
+            self.rowcount = self._update_rowcount
+        elif normalized.startswith("INSERT"):
+            self.rowcount = 1
+
+    def __enter__(self) -> "FakeDecisionCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class FakeDecisionConnection:
+    def __init__(self, cursor: FakeDecisionCursor) -> None:
+        self._cursor = cursor
+        self.committed = False
+        self.rolled_back = False
+
+    def cursor(self) -> FakeDecisionCursor:
+        return self._cursor
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def __enter__(self) -> "FakeDecisionConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            self.rolled_back = True
+        return False  # never suppress -- propagate like a real psycopg connection
+
+
+def test_record_reviewer_decision_race_guard_raises_and_inserts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second concurrent decision (RefundRequest no longer status=
+    'escalated' by the time the UPDATE runs) must raise
+    ConcurrentDecisionError, insert no ApprovalQueueEntry row, and leave
+    nothing committed. Also asserts the UPDATE was issued with the right
+    bound params before it lost the race -- a swapped STATUS_APPROVED/
+    STATUS_DENIED, or the wrong refund_request_id/STATUS_ESCALATED guard
+    value in the WHERE clause, would silently pass a query-shape-only
+    check but not this one.
+    """
+    cursor = FakeDecisionCursor(update_rowcount=0)
+    conn = FakeDecisionConnection(cursor)
+    monkeypatch.setattr(db, "_dsn", lambda: "fake-dsn")
+    monkeypatch.setattr(db.psycopg, "connect", lambda *args, **kwargs: conn)
+
+    with pytest.raises(db.ConcurrentDecisionError):
+        db.record_reviewer_decision("rr-race", "approve", "staff@example.com", FIXED_NOW)
+
+    assert not any(query.startswith("INSERT") for query in cursor.queries)
+    assert conn.committed is False
+    assert conn.rolled_back is True
+
+    update_sql, update_params = cursor.calls[0]
+    assert update_sql.startswith("UPDATE")
+    assert update_params == (db.STATUS_APPROVED, "rr-race", db.STATUS_ESCALATED)
+
+
+def test_record_reviewer_decision_success_inserts_entry_and_commits(monkeypatch: pytest.MonkeyPatch) -> None:
+    cursor = FakeDecisionCursor(update_rowcount=1)
+    conn = FakeDecisionConnection(cursor)
+    monkeypatch.setattr(db, "_dsn", lambda: "fake-dsn")
+    monkeypatch.setattr(db.psycopg, "connect", lambda *args, **kwargs: conn)
+
+    entry = db.record_reviewer_decision("rr-ok", "deny", "staff@example.com", FIXED_NOW)
+
+    assert entry.refund_request_id == "rr-ok"
+    assert entry.decision == "deny"
+    assert entry.reviewer_identifier == "staff@example.com"
+    assert any(query.startswith("INSERT") for query in cursor.queries)
+    assert conn.committed is True
+    assert conn.rolled_back is False
+
+    assert len(cursor.calls) == 2
+    update_sql, update_params = cursor.calls[0]
+    assert update_sql.startswith("UPDATE")
+    # "deny" writes STATUS_DENIED directly (never the short-lived
+    # STATUS_APPROVED interim status that only the approve path uses).
+    assert update_params == (db.STATUS_DENIED, "rr-ok", db.STATUS_ESCALATED)
+
+    insert_sql, insert_params = cursor.calls[1]
+    assert insert_sql.startswith("INSERT")
+    assert insert_params is not None
+    assert insert_params[1:] == ("rr-ok", "deny", "staff@example.com", FIXED_NOW)
+
+
+def test_record_reviewer_decision_rejects_unrecognized_decision_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defense-in-depth at the domain/db boundary: any decision value other
+    than "approve"/"deny" must raise ValueError, never silently fall
+    through to the deny/STATUS_DENIED path."""
+    cursor = FakeDecisionCursor(update_rowcount=1)
+    conn = FakeDecisionConnection(cursor)
+    monkeypatch.setattr(db, "_dsn", lambda: "fake-dsn")
+    monkeypatch.setattr(db.psycopg, "connect", lambda *args, **kwargs: conn)
+
+    with pytest.raises(ValueError):
+        db.record_reviewer_decision("rr-bad", "maybe", "staff@example.com", FIXED_NOW)
+
+    assert cursor.calls == []  # rejected before ever touching the database
 
 
 def test_unexpected_policy_failure_returns_failed_not_escalated(monkeypatch: pytest.MonkeyPatch) -> None:

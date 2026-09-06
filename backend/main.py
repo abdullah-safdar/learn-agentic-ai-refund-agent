@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import db
 from errors import register_error_handlers
+from routes import approvals as approvals_api
 from routes import chat as chat_api
 from routes import dev as dev_api
 from routes import trajectory as trajectory_api
@@ -58,3 +59,4 @@ app.add_middleware(
 app.include_router(chat_api.router)
 app.include_router(dev_api.router)
 app.include_router(trajectory_api.router)
+app.include_router(approvals_api.router)

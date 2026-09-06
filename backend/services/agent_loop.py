@@ -14,14 +14,17 @@ from typing import Any, Dict, Optional, Union
 import db
 from models import (
     STATUS_COMPLETED,
+    STATUS_DENIED,
     STATUS_ESCALATED,
     STATUS_FAILED,
     STEP_TYPE_ORDER_LOOKUP,
     STEP_TYPE_OUTCOME,
     STEP_TYPE_POLICY_DECISION,
+    STEP_TYPE_REVIEWER_DECISION,
     STEP_TYPE_STRIPE_REFUND,
     AgentResult,
     Completed,
+    Denied,
     Escalated,
     Failed,
     NewRequestInput,
@@ -129,6 +132,8 @@ def _status_for(result: AgentResult) -> str:
         return STATUS_ESCALATED
     if isinstance(result, Failed):
         return STATUS_FAILED
+    if isinstance(result, Denied):
+        return STATUS_DENIED
     raise TypeError(f"Unhandled AgentResult variant: {type(result)!r}")
 
 
@@ -298,11 +303,111 @@ def _run_new_request(refund_request: RefundRequest, rate_limiter, now: datetime)
     return stripe_result
 
 
+def _resume_request(
+    refund_request_id: str,
+    reviewer_decision: str,
+    reviewer_identifier: str,
+    rate_limiter,
+    now: datetime,
+) -> AgentResult:
+    """Resume after a human reviewer's decision on an Escalated request
+    (spec-1-6). The reviewer_decision step is recorded first, before either
+    branch proceeds, so the trajectory shows who decided what even if
+    everything after it fails.
+
+    `reviewer_decision` must be "approve" or "deny" -- already validated by
+    the caller (routes/approvals.py) before this is ever called, but
+    re-checked here too (raising ValueError for anything else) as
+    defense-in-depth at the domain boundary itself: silently treating any
+    unrecognized value as "deny" would be a much worse failure mode than an
+    explicit error.
+
+    Deny is terminal in one step -- no Stripe call, no order lookup.
+
+    Approve re-attempts through the *same* `_resolve_order`/`_call_stripe`
+    path `_run_new_request` uses above -- no new Stripe logic, and
+    deliberately no re-run of `policy.evaluate_policy()`/the Escalation
+    Threshold check: a human already overrode those automatic checks by
+    approving. A resume that fails order lookup, finds no order, can't
+    resolve an amount, or fails at Stripe still returns Escalated -- never
+    auto-denies, never Failed for a business-as-usual retry-exhaustion.
+    """
+    if reviewer_decision not in ("approve", "deny"):
+        raise ValueError(f"reviewer_decision must be 'approve' or 'deny', got {reviewer_decision!r}.")
+
+    refund_request = db.find_refund_request_by_id(refund_request_id)
+    if refund_request is None:
+        # Not a normal business outcome -- the caller (routes/approvals.py)
+        # already resolved refund_request_id to a real row via
+        # db.record_reviewer_decision()'s atomic guard before ever calling
+        # run(), so this would mean that row vanished between the decision
+        # write and this read. Surfaces as Failed via run()'s try/except,
+        # never silently mishandled.
+        raise RuntimeError(
+            f"ResumeInput refers to refund_request_id={refund_request_id!r}, which no longer exists."
+        )
+
+    _record_step(
+        refund_request_id,
+        STEP_TYPE_REVIEWER_DECISION,
+        {"decision": reviewer_decision, "reviewer_identifier": reviewer_identifier},
+        now,
+    )
+
+    if reviewer_decision != "approve":
+        return Denied(refund_request_id=refund_request_id)
+
+    lookup_succeeded, order, attempts = _resolve_order(refund_request, rate_limiter)
+    _record_step(
+        refund_request_id,
+        STEP_TYPE_ORDER_LOOKUP,
+        {
+            "found": lookup_succeeded and order is not None,
+            "retries_used": attempts - 1,
+            "lookup_succeeded": lookup_succeeded,
+        },
+        now,
+    )
+    if not lookup_succeeded:
+        return _escalated_for(refund_request)
+
+    requested_amount_cents = _resolve_requested_amount_cents(refund_request, order)
+    if order is None or requested_amount_cents is None:
+        # Order genuinely not found (lookup succeeded but found nothing) or
+        # no amount resolvable -- there's no policy check to fall back on
+        # here (deliberately skipped, see docstring), so this can't proceed
+        # to Stripe; escalate instead of raising, matching the "never
+        # auto-denies, never Failed" contract for a resume.
+        return _escalated_for(refund_request)
+
+    stripe_result = _call_stripe(refund_request, order, requested_amount_cents, rate_limiter)
+    if isinstance(stripe_result, Completed):
+        stripe_step_data: Dict[str, Any] = {
+            "outcome": "completed",
+            "refund_id": stripe_result.refund_id,
+            "amount_cents": stripe_result.amount_cents,
+        }
+    else:
+        stripe_step_data = {"outcome": "escalated"}
+    _record_step(refund_request_id, STEP_TYPE_STRIPE_REFUND, stripe_step_data, now)
+
+    return stripe_result
+
+
 def run(input: RunInput, rate_limiter, now: Optional[datetime] = None) -> AgentResult:
     """The Agent Loop's single entry point. `RunInput` covers both forward
-    execution (NewRequestInput, today) and resuming after Escalation
-    (ResumeInput, not handled yet) through the same entry point -- never a
-    second method.
+    execution (NewRequestInput) and resuming after Escalation (ResumeInput)
+    through the same entry point -- never a second method. `run()` itself
+    still persists nothing -- the caller writes RefundRequest.status after
+    run() returns (chat.py for NewRequestInput, routes/approvals.py for
+    ResumeInput). For a resume specifically, RefundRequest.status is
+    actually touched twice around this call, both times by the caller:
+    routes/approvals.py calls db.record_reviewer_decision() *before* run()
+    ever runs, which writes a short-lived interim status
+    (STATUS_APPROVED/STATUS_DENIED) atomically alongside the
+    ApprovalQueueEntry insert; the caller then overwrites that with the
+    real resolved outcome after run() returns, exactly like the
+    NewRequestInput path. run() itself is untouched by either write.
 
     Any unexpected failure (a policy bug, a defensive assertion, ...) is
     caught here and surfaces as Failed rather than propagating -- run()
@@ -312,33 +417,44 @@ def run(input: RunInput, rate_limiter, now: Optional[datetime] = None) -> AgentR
     only a genuine bug does.
     """
     if isinstance(input, ResumeInput):
-        raise NotImplementedError("ResumeInput handling isn't wired up yet")
-    if not isinstance(input, NewRequestInput):
+        refund_request_id = input.refund_request_id
+    elif isinstance(input, NewRequestInput):
+        refund_request_id = input.refund_request.id
+    else:
         raise TypeError(f"Unsupported RunInput variant: {type(input)!r}")
 
     current_time = now or datetime.now(timezone.utc)
 
     try:
-        result: AgentResult = _run_new_request(input.refund_request, rate_limiter, current_time)
+        if isinstance(input, ResumeInput):
+            result: AgentResult = _resume_request(
+                input.refund_request_id,
+                input.reviewer_decision,
+                input.reviewer_identifier,
+                rate_limiter,
+                current_time,
+            )
+        else:
+            result = _run_new_request(input.refund_request, rate_limiter, current_time)
     except Exception as exc:  # noqa: BLE001 -- translate any unexpected failure to Failed
         # Never the raw exception text -- the trajectory's terminal
         # `outcome` step records only the resolved status, matching the
         # "no raw exceptions" field allowlist.
         result = Failed(reason=str(exc))
 
-    # Recorded before every return -- Completed/Escalated/Failed alike.
-    # The whole step (computing the status string via _status_for AND the
-    # _record_step call) is wrapped here, not just _record_step's own
-    # internal guard: _status_for raises TypeError for an AgentResult
+    # Recorded before every return -- Completed/Escalated/Failed/Denied
+    # alike. The whole step (computing the status string via _status_for
+    # AND the _record_step call) is wrapped here, not just _record_step's
+    # own internal guard: _status_for raises TypeError for an AgentResult
     # variant it doesn't recognize, which -- unreachable today, but a live
     # landmine for a future variant -- must never propagate out of run()
     # either. Nothing in outcome recording may affect the resolved result.
     try:
-        _record_step(input.refund_request.id, STEP_TYPE_OUTCOME, {"status": _status_for(result)}, current_time)
+        _record_step(refund_request_id, STEP_TYPE_OUTCOME, {"status": _status_for(result)}, current_time)
     except Exception:  # noqa: BLE001 -- outcome recording must never affect the resolved AgentResult
         logger.warning(
             "Failed to record terminal outcome TrajectoryEvent for refund_request_id=%r",
-            input.refund_request.id,
+            refund_request_id,
             exc_info=True,
         )
     return result

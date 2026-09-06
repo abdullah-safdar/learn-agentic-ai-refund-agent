@@ -19,6 +19,16 @@ STATUS_PENDING = "pending"
 STATUS_COMPLETED = "completed"
 STATUS_ESCALATED = "escalated"
 STATUS_FAILED = "failed"
+# spec-1-6: STATUS_APPROVED is a short-lived interim status, needed only so
+# db.record_reviewer_decision()'s atomic `WHERE status = 'escalated'` guard
+# has somewhere to transition *to* before the Agent Loop actually resolves
+# the resume -- it's overwritten with the real outcome moments later, in the
+# same request, once run() returns (see routes/approvals.py). It should
+# never be user-visible for more than the duration of one HTTP request.
+# STATUS_DENIED is terminal -- deny never calls Stripe and ends the case in
+# one step.
+STATUS_APPROVED = "approved"
+STATUS_DENIED = "denied"
 
 ORDER_STATUS_COMPLETED = "completed"
 
@@ -29,6 +39,10 @@ STEP_TYPE_ORDER_LOOKUP = "order_lookup"
 STEP_TYPE_POLICY_DECISION = "policy_decision"
 STEP_TYPE_STRIPE_REFUND = "stripe_refund"
 STEP_TYPE_OUTCOME = "outcome"
+# spec-1-6: recorded once per ResumeInput, before either branch (deny/
+# approve) proceeds -- captures who decided what, distinct from the
+# customer-facing steps above.
+STEP_TYPE_REVIEWER_DECISION = "reviewer_decision"
 
 
 def utc_now_iso8601() -> str:
@@ -170,12 +184,15 @@ class NewRequestInput:
 
 @dataclass(frozen=True)
 class ResumeInput:
-    """Resume after a human reviewer acts on an Escalated request -- not
-    handled yet, but the shape already exists so `run()`'s signature won't
-    need to change when it is."""
+    """Resume after a human reviewer acts on an Escalated request
+    (spec-1-6). `reviewer_identifier` is who decided -- recorded onto the
+    STEP_TYPE_REVIEWER_DECISION trajectory step by agent_loop._resume_request,
+    independently of (but consistently with) the same identifier already
+    persisted onto ApprovalQueueEntry by db.record_reviewer_decision()."""
 
     refund_request_id: str
     reviewer_decision: str
+    reviewer_identifier: str
 
 
 RunInput = Union[NewRequestInput, ResumeInput]
@@ -198,4 +215,33 @@ class Failed:
     reason: str
 
 
-AgentResult = Union[Completed, Escalated, Failed]
+@dataclass(frozen=True)
+class Denied:
+    """A reviewer denied the request (spec-1-6) -- a real terminal business
+    outcome, distinct from Failed (an unexpected/internal failure) and from
+    Completed (money actually moved). Deny never calls Stripe."""
+
+    refund_request_id: str
+
+
+AgentResult = Union[Completed, Escalated, Failed, Denied]
+
+
+# --- Staff Approval Queue (spec-1-6) ----------------------------------------
+
+
+@dataclass(frozen=True)
+class ApprovalQueueEntry:
+    """One immutable row recording a reviewer's decision on an Escalated
+    RefundRequest -- inserted by db.record_reviewer_decision() in the same
+    DB transaction as the RefundRequest.status transition it guards.
+    Append-only, like TrajectoryEvent, and never read to decide "is this
+    approved" -- RefundRequest.status stays the sole canonical lifecycle
+    field (AD-7); this table exists purely as an audit trail of who decided
+    what and when."""
+
+    id: str
+    refund_request_id: str
+    decision: str
+    reviewer_identifier: str
+    decided_at: str

@@ -15,7 +15,16 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from models import EscalationThreshold, Order, RefundRequest, TrajectoryEvent
+from models import (
+    STATUS_APPROVED,
+    STATUS_DENIED,
+    STATUS_ESCALATED,
+    ApprovalQueueEntry,
+    EscalationThreshold,
+    Order,
+    RefundRequest,
+    TrajectoryEvent,
+)
 
 CREATE_REFUND_REQUESTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS refund_requests (
@@ -75,6 +84,22 @@ CREATE TABLE IF NOT EXISTS escalation_thresholds (
     dollar_threshold_cents BIGINT NOT NULL,
     effective_at TIMESTAMPTZ NOT NULL,
     changed_by TEXT NOT NULL
+);
+"""
+
+# spec-1-6: one row per reviewer decision on an Escalated RefundRequest,
+# foreign-keyed to it. Append-only -- no update/delete path exists anywhere
+# in this module, same precedent as trajectory_events above. This table is
+# an audit trail only; RefundRequest.status stays the sole canonical
+# lifecycle field (AD-7) -- nothing ever reads this table to decide "is this
+# approved".
+CREATE_APPROVAL_QUEUE_ENTRIES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS approval_queue_entries (
+    id UUID PRIMARY KEY,
+    refund_request_id UUID NOT NULL REFERENCES refund_requests(id),
+    decision TEXT NOT NULL,
+    reviewer_identifier TEXT NOT NULL,
+    decided_at TIMESTAMPTZ NOT NULL
 );
 """
 
@@ -142,10 +167,18 @@ def _row_to_escalation_threshold(row: dict[str, Any]) -> EscalationThreshold:
     )
 
 
+class ConcurrentDecisionError(Exception):
+    """Raised by record_reviewer_decision() when refund_request_id is no
+    longer status=STATUS_ESCALATED at decision time -- a second concurrent
+    decision on the same request. No ApprovalQueueEntry row is inserted
+    when this is raised (I/O & Edge-Case Matrix: "Double decision (race)");
+    callers (routes/approvals.py) translate this into a 409 Conflict."""
+
+
 def run_migrations() -> None:
-    """Create the refund_requests, orders, trajectory_events, and
-    escalation_thresholds tables if they don't already exist. Idempotent --
-    safe to call on every startup.
+    """Create the refund_requests, orders, trajectory_events,
+    escalation_thresholds, and approval_queue_entries tables if they don't
+    already exist. Idempotent -- safe to call on every startup.
 
     escalation_thresholds also gets one default row seeded here (and only
     here -- there's no admin write path this story) if the table is
@@ -162,6 +195,7 @@ def run_migrations() -> None:
             cur.execute(CREATE_ORDERS_TABLE_SQL)
             cur.execute(CREATE_TRAJECTORY_EVENTS_TABLE_SQL)
             cur.execute(CREATE_ESCALATION_THRESHOLDS_TABLE_SQL)
+            cur.execute(CREATE_APPROVAL_QUEUE_ENTRIES_TABLE_SQL)
             cur.execute(
                 """
                 INSERT INTO escalation_thresholds
@@ -407,3 +441,84 @@ def get_current_escalation_threshold(now: datetime) -> EscalationThreshold:
             "table should have been seeded by run_migrations()."
         )
     return _row_to_escalation_threshold(row)
+
+
+def list_escalated_refund_requests() -> List[RefundRequest]:
+    """Every RefundRequest currently `status = 'escalated'`, oldest first
+    (FIFO queue) -- the Approval Queue list endpoint's sole data source.
+    Never derived from ApprovalQueueEntry (AD-7: RefundRequest.status stays
+    the sole canonical lifecycle field)."""
+    with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, order_reference, reason, amount_cents, status, created_at
+                FROM refund_requests
+                WHERE status = %s
+                ORDER BY created_at ASC
+                """,
+                (STATUS_ESCALATED,),
+            )
+            rows = cur.fetchall()
+    return [_row_to_refund_request(row) for row in rows]
+
+
+def record_reviewer_decision(
+    refund_request_id: str, decision: str, reviewer_identifier: str, now: datetime
+) -> ApprovalQueueEntry:
+    """Atomically transitions RefundRequest.status and inserts one
+    ApprovalQueueEntry row recording who decided what -- a single DB
+    transaction, guarded by `WHERE status = 'escalated'` on the UPDATE so a
+    second concurrent decision on the same refund_request_id fails loudly
+    (raises ConcurrentDecisionError, no ApprovalQueueEntry row inserted)
+    instead of silently double-processing.
+
+    `decision` must be "approve" or "deny" -- already validated by the
+    caller (routes/approvals.py) before this is ever called, but re-checked
+    here too (raising ValueError for anything else) as defense-in-depth at
+    the domain/db boundary itself, since a silent fall-through to "deny"
+    for an unrecognized value would be a much worse failure mode than an
+    explicit error. The interim status this writes for "approve" is
+    STATUS_APPROVED (short-lived -- the caller overwrites it with the real
+    outcome once agent_loop.run() resolves, in the same request); for
+    "deny" it writes STATUS_DENIED directly, which is already terminal.
+
+    Mirrors update_refund_status()'s rowcount-guard precedent above, but
+    raising here (rather than returning) propagates out of the `with
+    psycopg.connect(...) as conn:` block before `conn.commit()` is ever
+    reached -- psycopg automatically rolls back an in-flight transaction
+    when its connection context manager exits via an exception, so the
+    UPDATE it already issued never sticks either.
+    """
+    if decision not in ("approve", "deny"):
+        raise ValueError(f"decision must be 'approve' or 'deny', got {decision!r}.")
+    interim_status = STATUS_APPROVED if decision == "approve" else STATUS_DENIED
+    entry_id = uuid.uuid4()
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE refund_requests SET status = %s WHERE id = %s AND status = %s",
+                (interim_status, refund_request_id, STATUS_ESCALATED),
+            )
+            if cur.rowcount != 1:
+                raise ConcurrentDecisionError(
+                    f"record_reviewer_decision() found refund_request_id={refund_request_id!r} "
+                    f"no longer status={STATUS_ESCALATED!r} -- a concurrent decision already "
+                    "resolved it."
+                )
+            cur.execute(
+                """
+                INSERT INTO approval_queue_entries
+                    (id, refund_request_id, decision, reviewer_identifier, decided_at)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (entry_id, refund_request_id, decision, reviewer_identifier, now),
+            )
+        conn.commit()
+    return ApprovalQueueEntry(
+        id=str(entry_id),
+        refund_request_id=refund_request_id,
+        decision=decision,
+        reviewer_identifier=reviewer_identifier,
+        decided_at=_to_iso8601_utc(now),
+    )
