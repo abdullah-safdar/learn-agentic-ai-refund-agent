@@ -67,4 +67,4 @@ VALUES (gen_random_uuid(), 0.7, 100, now(), 'manual-test');
 
 ## Next stage
 
-Stage 1.6 (not yet built) lets a staff reviewer see escalated requests and approve or deny them, resuming the Agent Loop to completion. See [Epics & Stories](../planning/EPICS.md) for the full planned sequence.
+[Stage 1.6](./story-1.6.md) lets a staff reviewer see escalated requests and approve or deny them, resuming the Agent Loop to completion.
