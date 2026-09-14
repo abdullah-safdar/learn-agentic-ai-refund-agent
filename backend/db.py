@@ -9,9 +9,10 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence, Tuple
 
 import psycopg
+from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -22,6 +23,7 @@ from models import (
     ApprovalQueueEntry,
     EscalationThreshold,
     Order,
+    PolicyChunk,
     RefundRequest,
     TrajectoryEvent,
 )
@@ -103,6 +105,33 @@ CREATE TABLE IF NOT EXISTS approval_queue_entries (
 );
 """
 
+# spec-2-1: the Policy Store (AD-6/AD-7) -- one row per clause of an
+# ingested refund policy document, on the existing Neon Postgres via
+# pgvector rather than a new datastore (AD-7). `document_id` is the
+# document_slug (no separate `documents` table exists this story).
+# `embedding` is fixed at 1024 dims -- Voyage AI's voyage-4-lite default
+# output size (Ask First: embeddings always use this model, independent of
+# LLM_PROVIDER; Anthropic does not offer its own embedding model). No index
+# on `embedding` (Ask First: brute-force distance is fine at this scale)
+# and no UNIQUE constraint on citation_id -- an unrelated-but-identically-
+# worded clause across two documents is a legitimate (if unlikely) case,
+# and supersede logic keys off document_id, not citation_id uniqueness.
+# Superseded (`is_active = false`) rows are never hard-deleted -- see
+# replace_policy_document_chunks() below.
+CREATE_POLICY_CHUNKS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS policy_chunks (
+    id UUID PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    citation_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    embedding VECTOR(1024) NOT NULL,
+    is_active BOOLEAN NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS policy_chunks_document_id_idx ON policy_chunks (document_id);
+"""
+
 # Ask First: seed values -- confidence_threshold=0.7, dollar_threshold_cents
 # =50000 ($500.00) -- flagged in the spec as the proposed defaults.
 DEFAULT_ESCALATION_CONFIDENCE_THRESHOLD = 0.7
@@ -158,6 +187,18 @@ def _row_to_trajectory_event(row: dict[str, Any]) -> TrajectoryEvent:
     )
 
 
+def _row_to_policy_chunk(row: dict[str, Any]) -> PolicyChunk:
+    return PolicyChunk(
+        id=str(row["id"]),
+        document_id=row["document_id"],
+        citation_id=row["citation_id"],
+        chunk_index=row["chunk_index"],
+        content=row["content"],
+        is_active=row["is_active"],
+        created_at=_to_iso8601_utc(row["created_at"]),
+    )
+
+
 def _row_to_escalation_threshold(row: dict[str, Any]) -> EscalationThreshold:
     return EscalationThreshold(
         confidence_threshold=row["confidence_threshold"],
@@ -191,11 +232,17 @@ def run_migrations() -> None:
     """
     with psycopg.connect(_dsn()) as conn:
         with conn.cursor() as cur:
+            # spec-2-1: must run before CREATE_POLICY_CHUNKS_TABLE_SQL --
+            # that table's `embedding VECTOR(1024)` column depends on the
+            # `vector` type this extension provides. AD-7: pgvector on the
+            # existing Postgres, not a new datastore.
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute(CREATE_REFUND_REQUESTS_TABLE_SQL)
             cur.execute(CREATE_ORDERS_TABLE_SQL)
             cur.execute(CREATE_TRAJECTORY_EVENTS_TABLE_SQL)
             cur.execute(CREATE_ESCALATION_THRESHOLDS_TABLE_SQL)
             cur.execute(CREATE_APPROVAL_QUEUE_ENTRIES_TABLE_SQL)
+            cur.execute(CREATE_POLICY_CHUNKS_TABLE_SQL)
             cur.execute(
                 """
                 INSERT INTO escalation_thresholds
@@ -522,3 +569,83 @@ def record_reviewer_decision(
         reviewer_identifier=reviewer_identifier,
         decided_at=_to_iso8601_utc(now),
     )
+
+
+def replace_policy_document_chunks(
+    document_id: str,
+    chunks: Sequence[Tuple[str, int, str, List[float]]],
+    now: datetime,
+) -> List[PolicyChunk]:
+    """Single-transaction supersede (spec-2-1): every currently-active
+    policy_chunks row for `document_id` is marked `is_active = false`, then
+    every row in `chunks` is inserted fresh as `is_active = true`. Old rows
+    are never hard-deleted -- a citation_id any past decision already cited
+    must keep resolving even after this document is re-ingested.
+
+    `chunks` is `(citation_id, chunk_index, content, embedding)` tuples,
+    already chunked and embedded by the caller
+    (services/policy_ingestion.py) -- this function only persists, mirroring
+    record_reviewer_decision()'s "guarded UPDATE then INSERT, one
+    transaction" shape above. Embedding must already be complete before this
+    is called: if `chunks` is wrong or an embedding call fails, that must
+    happen *before* this function ever opens its transaction, so a failure
+    never leaves a document half-superseded (no currently-active row marked
+    inactive without its replacement also landing, and vice versa).
+
+    If a previously-active clause has no corresponding entry in `chunks`
+    (the clause was removed from the source document), it is superseded
+    with no active replacement -- exactly the "clause removed" edge case in
+    the I/O & Edge-Case Matrix.
+    """
+    new_rows: List[PolicyChunk] = []
+    with psycopg.connect(_dsn()) as conn:
+        register_vector(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE policy_chunks SET is_active = false WHERE document_id = %s AND is_active = true",
+                (document_id,),
+            )
+            for citation_id, chunk_index, content, embedding in chunks:
+                chunk_id = uuid.uuid4()
+                cur.execute(
+                    """
+                    INSERT INTO policy_chunks
+                        (id, document_id, citation_id, chunk_index, content, embedding, is_active, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, true, %s)
+                    """,
+                    (chunk_id, document_id, citation_id, chunk_index, content, embedding, now),
+                )
+                new_rows.append(
+                    PolicyChunk(
+                        id=str(chunk_id),
+                        document_id=document_id,
+                        citation_id=citation_id,
+                        chunk_index=chunk_index,
+                        content=content,
+                        is_active=True,
+                        created_at=_to_iso8601_utc(now),
+                    )
+                )
+        conn.commit()
+    return new_rows
+
+
+def list_active_policy_chunks(document_id: str) -> List[PolicyChunk]:
+    """Every currently-active PolicyChunk for this document_id, ordered by
+    chunk_index ascending (source-document clause order). Superseded
+    (`is_active = false`) rows are never returned here -- Story 2.2's
+    retrieval adapter and this story's own manual verification both only
+    ever care about the current, live set of chunks."""
+    with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, document_id, citation_id, chunk_index, content, is_active, created_at
+                FROM policy_chunks
+                WHERE document_id = %s AND is_active = true
+                ORDER BY chunk_index ASC
+                """,
+                (document_id,),
+            )
+            rows = cur.fetchall()
+    return [_row_to_policy_chunk(row) for row in rows]

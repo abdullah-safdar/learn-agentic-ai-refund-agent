@@ -227,6 +227,33 @@ class Denied:
 AgentResult = Union[Completed, Escalated, Failed, Denied]
 
 
+# --- Policy Store (spec-2-1) -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PolicyChunk:
+    """One clause of an ingested refund policy document, embedded and
+    persisted by services/policy_ingestion.py -- inserted by
+    db.replace_policy_document_chunks(), never updated in place (supersede,
+    not overwrite). `citation_id` (`{document_slug}#{clause_slug}`) is
+    stable across re-ingestion of unrelated clauses; only this exact
+    clause's own removal/rename/reorder changes it. `document_id` is the
+    document_slug the chunk came from -- there is no separate `documents`
+    table this story. `is_active=False` rows are never hard-deleted: a past
+    decision's citation_ids must keep resolving even after the document
+    that produced them changes. Story 2.2's retrieval-backed Policy/Decision
+    adapter is this dataclass's first real reader; this story only writes
+    it."""
+
+    id: str
+    document_id: str
+    citation_id: str
+    chunk_index: int
+    content: str
+    is_active: bool
+    created_at: str
+
+
 # --- Staff Approval Queue (spec-1-6) ----------------------------------------
 
 
