@@ -1,10 +1,11 @@
-"""Embeds text for the Policy Store ingestion pipeline (spec-2-1). Always
-calls Voyage AI (`voyage-4-lite`), independent of the `LLM_PROVIDER` env var
-that llm.py switches on -- a deliberate asymmetry (Ask First): Anthropic
-does not offer its own embedding model (its docs point to Voyage AI as the
-recommended provider), and none of this project's other configured chat
-providers (groq/openai/xai) are being used for embeddings here either, so
-there is nothing to switch between.
+"""Embeds text for the Policy Store ingestion pipeline (spec-2-1) and for
+policy retrieval queries at decision time (spec-2-2, services/policy.py).
+Always calls Voyage AI (`voyage-4-lite`), independent of the `LLM_PROVIDER`
+env var that llm.py switches on -- a deliberate asymmetry (Ask First):
+Anthropic does not offer its own embedding model (its docs point to Voyage
+AI as the recommended provider), and none of this project's other
+configured chat providers (groq/openai/xai) are being used for embeddings
+here either, so there is nothing to switch between.
 
 Duplicates llm.py's lazy-client-cache shape (`_get_client()`) locally rather
 than importing llm.py's private function -- this module has exactly one
@@ -48,18 +49,23 @@ def _get_client() -> voyageai.Client:
     return _client
 
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
+def embed_texts(texts: List[str], input_type: str = "document") -> List[List[float]]:
     """Embed a batch of texts via Voyage AI, returning one embedding vector
     per input text, in the same order `texts` was given. Raises on any API
-    failure -- callers (services/policy_ingestion.py's ingest_document())
-    must let this propagate rather than catching it, so an embedding
-    failure never leaves a document's Policy Store rows half-superseded.
+    failure -- callers (services/policy_ingestion.py's ingest_document(),
+    services/policy.py's evaluate_policy()) must let this propagate rather
+    than catching it, so an embedding failure never leaves a document's
+    Policy Store rows half-superseded, and never silently defaults a policy
+    decision.
 
-    `input_type="document"` is passed on every call -- these texts are
-    always policy clauses being indexed for later retrieval, never a
-    search query, and Voyage's own guidance is to always set this
-    parameter (never leave it `None`) for retrieval/RAG use cases, since it
-    changes the prompt Voyage prepends internally before embedding.
+    `input_type` defaults to `"document"` -- ingestion (policy_ingestion.py)
+    always indexes policy clauses for later retrieval and relies on that
+    default. Retrieval-time callers (policy.py, embedding a decision's
+    query text) must instead pass `input_type="query"`. Voyage's own
+    guidance is to always set this parameter explicitly (never leave it
+    `None`) for retrieval/RAG use cases, since it changes the prompt Voyage
+    prepends internally before embedding, and document/query texts should
+    get different prompts.
 
     Also raises if the response doesn't contain exactly one embedding per
     input text, or if any returned embedding's dimension doesn't match
@@ -72,7 +78,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
         return []
     client = _get_client()
     model = os.environ.get("EMBEDDING_MODEL", DEFAULT_MODEL)
-    response = client.embed(texts, model=model, input_type="document")
+    response = client.embed(texts, model=model, input_type=input_type)
     if len(response.embeddings) != len(texts):
         raise RuntimeError(
             f"Voyage AI embeddings response returned {len(response.embeddings)} embedding(s) for "

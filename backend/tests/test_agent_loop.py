@@ -11,15 +11,18 @@ Two groups of tests:
    the Failed path. `rate_limiter` is still passed straight into `run()` as
    a parameter (not monkeypatched) -- it just needs a plain object with an
    `.allow(key) -> bool` method, no formal interface required.
-2. Policy-rule tests exercise `policy.evaluate_policy()` directly
-   (including the exact return-window boundary) -- the function's own
-   logic, not `run()`'s orchestration around it.
+2. Policy-rule tests exercise `policy.evaluate_policy()` directly -- the
+   function's own guard logic and (spec-2-2-policy-cited-compliance-
+   checking-replaces-the-hardcoded-rule-set.md) its RAG-backed branch, with
+   `embeddings.embed_texts`/`db.search_policy_chunks`/
+   `llm.judge_policy_compliance` monkeypatched -- not `run()`'s
+   orchestration around it.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -39,15 +42,16 @@ from models import (
     Failed,
     NewRequestInput,
     Order,
+    PolicyChunk,
     PolicyDecision,
     RefundRequest,
     ResumeInput,
     TrajectoryEvent,
 )
+from services import embeddings, llm
 from services import policy as policy_module
 from services import stripe_refund
 from services.agent_loop import ORDER_LOOKUP_RETRY_CAP, _idempotency_key_for, run
-from services.policy import RETURN_WINDOW_DAYS
 
 FIXED_NOW = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -189,12 +193,12 @@ class FakePolicy:
         self._decision = decision
         self.calls: List[tuple] = []
 
-    def __call__(self, order, requested_amount_cents, now):
-        self.calls.append((order, requested_amount_cents, now))
+    def __call__(self, order, requested_amount_cents, reason, now):
+        self.calls.append((order, requested_amount_cents, reason, now))
         return self._decision
 
 
-def raising_policy(order, requested_amount_cents, now):
+def raising_policy(order, requested_amount_cents, reason, now):
     raise RuntimeError("simulated policy failure")
 
 
@@ -1106,58 +1110,227 @@ def test_trajectory_write_failure_is_logged_at_warning_or_above(
 
 
 # --------------------------------------------------------------------------
-# Policy-rule tests (policy.evaluate_policy directly)
+# Policy-rule tests (policy.evaluate_policy directly) -- spec-2-2's I/O &
+# Edge-Case Matrix. Guard-path tests (order/amount problems) never touch
+# embeddings/db/llm -- monkeypatched to raise if that assumption is ever
+# violated. RAG-branch tests monkeypatch
+# embeddings.embed_texts/db.search_policy_chunks/llm.judge_policy_compliance,
+# mirroring test_policy_ingestion.py's install_repo()/install_embeddings()
+# shape.
 # --------------------------------------------------------------------------
 
 
-def test_policy_compliant_when_all_four_rules_pass() -> None:
-    order = make_order(amount_cents=5000, order_date=FIXED_NOW.isoformat().replace("+00:00", "Z"))
+def make_policy_chunk(
+    citation_id: str = "refund-policy#return-window",
+    document_id: str = "refund-policy",
+    chunk_index: int = 0,
+    content: str = "Refunds must be requested within 30 days of the order date.",
+) -> PolicyChunk:
+    return PolicyChunk(
+        id=f"chunk-{citation_id}",
+        document_id=document_id,
+        citation_id=citation_id,
+        chunk_index=chunk_index,
+        content=content,
+        is_active=True,
+        created_at=FIXED_NOW.isoformat().replace("+00:00", "Z"),
+    )
 
-    decision = policy_module.evaluate_policy(order, 5000, FIXED_NOW)
 
-    assert decision.compliant is True
+def _raising_embed_texts(texts: List[str], input_type: str = "document") -> List[List[float]]:
+    raise AssertionError("embeddings.embed_texts must not be called when a guard fails")
+
+
+def _raising_search_policy_chunks(query_embedding: List[float], limit: int) -> List[PolicyChunk]:
+    raise AssertionError("db.search_policy_chunks must not be called when a guard fails")
+
+
+def _raising_judge_policy_compliance(order, requested_amount_cents, reason, now, candidate_chunks) -> PolicyDecision:
+    raise AssertionError("llm.judge_policy_compliance must not be called when a guard fails")
+
+
+DEFAULT_POLICY_REASON = "item arrived defective"
+
+
+@pytest.fixture()
+def no_rag_calls_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Installed on every guard-failure test below -- proves the guard
+    short-circuits *before* any embedding/retrieval/LLM call, per the I/O &
+    Edge-Case Matrix ("On guard failure ... no embedding/LLM call")."""
+    monkeypatch.setattr(embeddings, "embed_texts", _raising_embed_texts)
+    monkeypatch.setattr(db, "search_policy_chunks", _raising_search_policy_chunks)
+    monkeypatch.setattr(llm, "judge_policy_compliance", _raising_judge_policy_compliance)
+
+
+def install_policy_rag_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candidate_chunks: Optional[List[PolicyChunk]] = None,
+    judgment: Optional[PolicyDecision] = None,
+) -> Dict[str, List[Any]]:
+    calls: Dict[str, List[Any]] = {"embed_texts": [], "search_policy_chunks": [], "judge_policy_compliance": []}
+    chunks_to_return = [make_policy_chunk()] if candidate_chunks is None else candidate_chunks
+
+    def _fake_embed(texts: List[str], input_type: str = "document") -> List[List[float]]:
+        calls["embed_texts"].append((texts, input_type))
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+    def _fake_search(query_embedding: List[float], limit: int) -> List[PolicyChunk]:
+        calls["search_policy_chunks"].append((query_embedding, limit))
+        return chunks_to_return
+
+    def _fake_judge(order, requested_amount_cents, reason, now, candidate_chunks) -> PolicyDecision:
+        calls["judge_policy_compliance"].append((order, requested_amount_cents, reason, now, candidate_chunks))
+        if judgment is not None:
+            return judgment
+        default_citations = [candidate_chunks[0].citation_id] if candidate_chunks else []
+        return PolicyDecision(compliant=True, confidence=0.9, citation_ids=default_citations)
+
+    monkeypatch.setattr(embeddings, "embed_texts", _fake_embed)
+    monkeypatch.setattr(db, "search_policy_chunks", _fake_search)
+    monkeypatch.setattr(llm, "judge_policy_compliance", _fake_judge)
+    return calls
+
+
+def test_policy_non_compliant_when_order_is_none(no_rag_calls_allowed: None) -> None:
+    decision = policy_module.evaluate_policy(None, 1000, DEFAULT_POLICY_REASON, FIXED_NOW)
+    assert decision.compliant is False
+    assert decision.confidence == 1.0
     assert decision.citation_ids == []
 
 
-def test_policy_non_compliant_when_order_is_none() -> None:
-    decision = policy_module.evaluate_policy(None, 1000, FIXED_NOW)
-    assert decision.compliant is False
-
-
-def test_policy_non_compliant_when_order_not_completed() -> None:
+def test_policy_non_compliant_when_order_not_completed(no_rag_calls_allowed: None) -> None:
     order = make_order(status="cancelled")
-    decision = policy_module.evaluate_policy(order, 1000, FIXED_NOW)
+    decision = policy_module.evaluate_policy(order, 1000, DEFAULT_POLICY_REASON, FIXED_NOW)
+    assert decision.compliant is False
+    assert decision.citation_ids == []
+
+
+def test_policy_non_compliant_when_amount_exceeds_order(no_rag_calls_allowed: None) -> None:
+    order = make_order(amount_cents=5000)
+    decision = policy_module.evaluate_policy(order, 5001, DEFAULT_POLICY_REASON, FIXED_NOW)
     assert decision.compliant is False
 
 
-def test_policy_non_compliant_when_amount_exceeds_order() -> None:
+def test_policy_non_compliant_when_amount_is_none(no_rag_calls_allowed: None) -> None:
     order = make_order(amount_cents=5000)
-    decision = policy_module.evaluate_policy(order, 5001, FIXED_NOW)
+    decision = policy_module.evaluate_policy(order, None, DEFAULT_POLICY_REASON, FIXED_NOW)
     assert decision.compliant is False
 
 
 @pytest.mark.parametrize("amount", [0, -100])
-def test_policy_non_compliant_for_zero_or_negative_amount(amount: int) -> None:
+def test_policy_non_compliant_for_zero_or_negative_amount(amount: int, no_rag_calls_allowed: None) -> None:
     order = make_order(amount_cents=5000)
-    decision = policy_module.evaluate_policy(order, amount, FIXED_NOW)
+    decision = policy_module.evaluate_policy(order, amount, DEFAULT_POLICY_REASON, FIXED_NOW)
     assert decision.compliant is False
 
 
-def test_policy_compliant_exactly_at_return_window_boundary() -> None:
-    """Exact boundary: an order dated exactly RETURN_WINDOW_DAYS ago is
-    still within the window (the check is `now > cutoff`, not `>=`)."""
-    order_date = FIXED_NOW - timedelta(days=RETURN_WINDOW_DAYS)
-    order = make_order(amount_cents=1000, order_date=order_date.isoformat().replace("+00:00", "Z"))
+def test_policy_rag_branch_returns_llm_judgment_grounded_in_retrieved_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    order = make_order(amount_cents=5000)
+    chunk = make_policy_chunk(citation_id="refund-policy#return-window")
+    calls = install_policy_rag_fakes(
+        monkeypatch,
+        candidate_chunks=[chunk],
+        judgment=PolicyDecision(compliant=True, confidence=0.82, citation_ids=[chunk.citation_id]),
+    )
 
-    decision = policy_module.evaluate_policy(order, 1000, FIXED_NOW)
+    decision = policy_module.evaluate_policy(order, 2000, DEFAULT_POLICY_REASON, FIXED_NOW)
 
     assert decision.compliant is True
+    assert decision.confidence == 0.82
+    assert decision.citation_ids == [chunk.citation_id]
+    # embedded with input_type="query" -- not ingestion's "document" default
+    assert calls["embed_texts"][0][1] == "query"
+    # reason flows into the embedded query text (spec-2-2 change log)
+    assert DEFAULT_POLICY_REASON in calls["embed_texts"][0][0][0]
+    # top-K passed straight through to db.search_policy_chunks
+    assert calls["search_policy_chunks"][0][1] == policy_module.TOP_K_CANDIDATE_CHUNKS
+    # the LLM saw the reason and only the retrieved candidate set
+    assert calls["judge_policy_compliance"][0][2] == DEFAULT_POLICY_REASON
+    assert calls["judge_policy_compliance"][0][4] == [chunk]
 
 
-def test_policy_non_compliant_one_second_past_return_window_boundary() -> None:
-    order_date = FIXED_NOW - timedelta(days=RETURN_WINDOW_DAYS) - timedelta(seconds=1)
-    order = make_order(amount_cents=1000, order_date=order_date.isoformat().replace("+00:00", "Z"))
+def test_policy_rag_branch_zero_chunks_is_non_compliant_zero_confidence_no_llm_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order = make_order(amount_cents=5000)
+    calls = install_policy_rag_fakes(monkeypatch, candidate_chunks=[])
 
-    decision = policy_module.evaluate_policy(order, 1000, FIXED_NOW)
+    decision = policy_module.evaluate_policy(order, 2000, DEFAULT_POLICY_REASON, FIXED_NOW)
 
     assert decision.compliant is False
+    assert decision.confidence == 0.0
+    assert decision.citation_ids == []
+    assert calls["judge_policy_compliance"] == []  # never called
+
+
+def test_policy_rag_branch_drops_citation_ids_outside_the_candidate_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    order = make_order(amount_cents=5000)
+    chunk = make_policy_chunk(citation_id="refund-policy#return-window")
+    other_chunk = make_policy_chunk(citation_id="refund-policy#restocking-fee", chunk_index=1)
+    install_policy_rag_fakes(
+        monkeypatch,
+        candidate_chunks=[chunk, other_chunk],
+        judgment=PolicyDecision(
+            compliant=True,
+            confidence=0.9,
+            citation_ids=[chunk.citation_id, "hallucinated-doc#not-a-real-clause"],
+        ),
+    )
+
+    decision = policy_module.evaluate_policy(order, 2000, DEFAULT_POLICY_REASON, FIXED_NOW)
+
+    assert decision.citation_ids == [chunk.citation_id]  # the hallucinated id never reaches the caller
+
+
+def test_policy_rag_branch_compliant_with_all_citations_filtered_forces_non_compliant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """spec-2-2 change log: an LLM saying compliant=True but citing only
+    ids outside the candidate set must never reach the caller as
+    compliant -- every one of its citations turned out to be
+    hallucinated/invalid, so this is treated like a zero-chunks result."""
+    order = make_order(amount_cents=5000)
+    chunk = make_policy_chunk(citation_id="refund-policy#return-window")
+    install_policy_rag_fakes(
+        monkeypatch,
+        candidate_chunks=[chunk],
+        judgment=PolicyDecision(
+            compliant=True,
+            confidence=0.9,
+            citation_ids=["hallucinated-doc#not-a-real-clause"],
+        ),
+    )
+
+    decision = policy_module.evaluate_policy(order, 2000, DEFAULT_POLICY_REASON, FIXED_NOW)
+
+    assert decision.compliant is False
+    assert decision.confidence == 0.0
+    assert decision.citation_ids == []
+
+
+def test_policy_rag_branch_embedding_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    order = make_order(amount_cents=5000)
+
+    def _raise(texts: List[str], input_type: str = "document") -> List[List[float]]:
+        raise RuntimeError("simulated embedding API failure")
+
+    monkeypatch.setattr(embeddings, "embed_texts", _raise)
+
+    with pytest.raises(RuntimeError, match="simulated embedding API failure"):
+        policy_module.evaluate_policy(order, 2000, DEFAULT_POLICY_REASON, FIXED_NOW)
+
+
+def test_policy_rag_branch_llm_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    order = make_order(amount_cents=5000)
+    chunk = make_policy_chunk()
+    monkeypatch.setattr(embeddings, "embed_texts", lambda texts, input_type="document": [[0.1, 0.2] for _ in texts])
+    monkeypatch.setattr(db, "search_policy_chunks", lambda query_embedding, limit: [chunk])
+
+    def _raise(order, requested_amount_cents, reason, now, candidate_chunks) -> PolicyDecision:
+        raise RuntimeError("simulated LLM judgment failure")
+
+    monkeypatch.setattr(llm, "judge_policy_compliance", _raise)
+
+    with pytest.raises(RuntimeError, match="simulated LLM judgment failure"):
+        policy_module.evaluate_policy(order, 2000, DEFAULT_POLICY_REASON, FIXED_NOW)

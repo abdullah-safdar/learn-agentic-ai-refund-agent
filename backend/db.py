@@ -649,3 +649,34 @@ def list_active_policy_chunks(document_id: str) -> List[PolicyChunk]:
             )
             rows = cur.fetchall()
     return [_row_to_policy_chunk(row) for row in rows]
+
+
+def search_policy_chunks(query_embedding: List[float], limit: int) -> List[PolicyChunk]:
+    """Top-`limit` active PolicyChunks across every ingested document,
+    ordered by cosine distance (`embedding <=> %s`, pgvector's `<=>`
+    operator) to `query_embedding` -- Story 2.2's retrieval query behind
+    services/policy.py's evaluate_policy(). Superseded (`is_active = false`)
+    rows are never candidates, same as list_active_policy_chunks() above.
+
+    Brute-force `ORDER BY ... LIMIT` -- no index on `policy_chunks.embedding`
+    (Ask First: fine at this scale, same call Story 2.1 made for chunk
+    storage). `register_vector(conn)` is required on this connection so
+    `query_embedding` (a plain Python list) adapts to pgvector's `vector`
+    type for the `<=>` comparison, mirroring
+    replace_policy_document_chunks()'s own use of it above.
+    """
+    with psycopg.connect(_dsn(), row_factory=dict_row) as conn:
+        register_vector(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, document_id, citation_id, chunk_index, content, is_active, created_at
+                FROM policy_chunks
+                WHERE is_active = true
+                ORDER BY embedding <=> %s
+                LIMIT %s
+                """,
+                (query_embedding, limit),
+            )
+            rows = cur.fetchall()
+    return [_row_to_policy_chunk(row) for row in rows]

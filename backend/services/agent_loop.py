@@ -242,7 +242,7 @@ def _run_new_request(refund_request: RefundRequest, rate_limiter, now: datetime)
 
     requested_amount_cents = _resolve_requested_amount_cents(refund_request, order)
 
-    decision = policy.evaluate_policy(order, requested_amount_cents, now)
+    decision = policy.evaluate_policy(order, requested_amount_cents, refund_request.reason, now)
     _record_step(
         refund_request.id,
         STEP_TYPE_POLICY_DECISION,

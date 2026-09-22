@@ -41,6 +41,7 @@ from models import (
     ExtractedRefundFields,
     IntakeResult,
     Order,
+    PolicyDecision,
     RefundRequest,
     TrajectoryEvent,
 )
@@ -154,18 +155,29 @@ def install_default_escalation_threshold(monkeypatch: pytest.MonkeyPatch) -> Non
     before the Stripe call (spec-1-5-escalate-when-uncertain.md) -- these
     API-level tests exercise the full chat -> Agent Loop path and predate
     that check, so this default (every amount here is well below the
-    dollar cutoff, and the hardcoded policy always returns confidence=1.0)
-    keeps them resolving to Completed exactly as before. The escalation
+    dollar cutoff, and every compliant decision in this file -- real
+    guard-fail or the compliant_policy_fn stub above -- returns
+    confidence=1.0) keeps them resolving to Completed exactly as before.
+    The escalation
     threshold's own behavior is covered by tests/test_agent_loop.py."""
     monkeypatch.setattr(db, "get_current_escalation_threshold", lambda now: _DEFAULT_PASSING_ESCALATION_THRESHOLD)
 
 
-def raising_policy(order, requested_amount_cents, now):
+def raising_policy(order, requested_amount_cents, reason, now):
     """Simulates a policy implementation that violates its own contract by
     raising instead of always returning a PolicyDecision -- the only way
     agent_loop.run() resolves to Failed in this file (see
     tests/test_agent_loop.py's own unit-level version)."""
     raise RuntimeError("simulated policy failure")
+
+
+def compliant_policy_fn(order, requested_amount_cents, reason, now):
+    """A canned compliant PolicyDecision, standing in for the real
+    RAG-backed evaluate_policy() (spec-2-2) in tests here that only care
+    about the Completed/dedup happy path and have no need for a real
+    Voyage/Postgres/LLM call -- this file's own version of
+    tests/test_agent_loop.py's COMPLIANT_DECISION constant."""
+    return PolicyDecision(compliant=True, confidence=1.0, citation_ids=["stub-policy#stub-clause"])
 
 
 def install_repo(monkeypatch: pytest.MonkeyPatch, repo: FakeRepo) -> None:
@@ -341,11 +353,16 @@ def _build_test_app(
     install_fake_trajectory_recorder(monkeypatch)
     install_default_escalation_threshold(monkeypatch)
 
-    # Defaults: no matching order, the real (pure-logic, no-I/O) hardcoded
-    # policy function, and a Stripe fake that must never actually be called
-    # given the "order not found" default above -- together these keep
-    # every Story 1.1-style test passing (it resolves to Escalated, still a
-    # 200 response) without needing to know about the Agent Loop at all.
+    # Defaults: no matching order, the real evaluate_policy() (which, given
+    # no matching order below, short-circuits on its pure-logic, no-I/O
+    # guard and never reaches the RAG branch -- spec-2-2), and a Stripe fake
+    # that must never actually be called given the "order not found"
+    # default above -- together these keep every Story 1.1-style test
+    # passing (it resolves to Escalated, still a 200 response) without
+    # needing to know about the Agent Loop at all. Tests that supply a
+    # matching `order` (so the guard passes) must pass an explicit
+    # `policy_fn` (e.g. compliant_policy_fn above) so they don't hit a real
+    # Voyage/Postgres/LLM call.
     monkeypatch.setattr(db, "find_order_by_reference", FakeOrderLookup(order=order))
     monkeypatch.setattr(policy, "evaluate_policy", policy_fn or policy.evaluate_policy)
     monkeypatch.setattr(stripe_refund, "issue_refund", stripe or FakeStripe())
@@ -409,6 +426,7 @@ def test_completed_response_shape_for_compliant_order(monkeypatch: pytest.Monkey
         llm_result=ExtractedRefundFields(order_reference="ORD-2000", reason="wrong item", amount_cents=2500),
         repo=repo,
         order=order,
+        policy_fn=compliant_policy_fn,
         stripe=FakeStripe(refund_id="re_completed_test"),
     )
     client = TestClient(app)
@@ -444,6 +462,7 @@ def test_completed_response_reflects_resolved_amount_when_request_amount_was_nul
         monkeypatch,
         llm_result=ExtractedRefundFields(order_reference="ORD-2100", reason="changed my mind", amount_cents=None),
         order=order,
+        policy_fn=compliant_policy_fn,
         stripe=FakeStripe(refund_id="re_null_amount_test"),
     )
     client = TestClient(app)
@@ -533,6 +552,7 @@ def test_deduplicated_request_does_not_re_run_agent_loop(monkeypatch: pytest.Mon
         monkeypatch,
         llm_result=ExtractedRefundFields(order_reference="ORD-2300", reason="wrong color", amount_cents=1500),
         order=order,
+        policy_fn=compliant_policy_fn,
         stripe=stripe,
     )
     client = TestClient(app)

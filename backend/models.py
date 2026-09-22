@@ -140,9 +140,10 @@ class EscalationThreshold:
 @dataclass(frozen=True)
 class PolicyDecision:
     """What `policy.evaluate_policy()` returns -- a fixed shape regardless
-    of how the decision was actually made (today: hardcoded rules; a later
-    stage: an LLM reasoning over real policy documents). `citation_ids`
-    stays empty until that exists."""
+    of how the decision was actually made. A pre-RAG guard failure or an
+    empty/ungrounded retrieval still returns this shape with
+    `citation_ids=[]`; a real RAG-backed judgment (spec-2-2) returns at
+    least one real `citation_id` whenever `compliant=True`."""
 
     compliant: bool
     confidence: float
