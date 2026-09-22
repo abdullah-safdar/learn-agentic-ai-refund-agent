@@ -22,6 +22,8 @@ This project is built as one evolving feature — a Stripe-backed customer refun
 | 1.5 | [`story-1.5-escalation-threshold`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-1.5-escalation-threshold) | A versioned Escalation Threshold makes the agent escalate large or low-confidence refunds instead of auto-approving them | [story-1.5.md](./story-1.5.md) |
 | 1.6 | [`story-1.6-approval-queue`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-1.6-approval-queue) | A staff Approval Queue lets a reviewer approve or deny an Escalated request, resuming the Agent Loop to completion | [story-1.6.md](./story-1.6.md) |
 | 2.1 | [`story-2.1-policy-ingestion`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-2.1-policy-ingestion) | Refund policy documents are chunked, embedded, and persisted into a Policy Store, each clause retrievable by a stable citation_id | [story-2.1.md](./story-2.1.md) |
+| 2.2 | [`story-2.2-policy-compliance`](https://github.com/abdullah-safdar/learn-agentic-ai-refund-agent/tree/story-2.2-policy-compliance) | Hardcoded refund rules are replaced with real RAG-backed compliance checking: query embedding, pgvector similarity search, and an LLM judgment with verified citations | [story-2.2.md](./story-2.2.md) |
+
 
 \* This tag reflects the project's original hexagonal (ports & adapters) implementation. The backend was later flattened for teaching clarity — see the "Why this doesn't look hexagonal anymore" section at the top of [story-1.1.md](./story-1.1.md) for why, and what changed. Story 1.1's actual behavior is unchanged; only its internal code structure is.
 

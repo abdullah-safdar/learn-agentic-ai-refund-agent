@@ -72,4 +72,4 @@ Re-run it any time, including with an edited document — it's idempotent by des
 
 ## Next stage
 
-Stage 2.2 (not yet built) reads what this stage writes: it replaces `services/policy.py`'s hardcoded rule set with a retrieval-backed adapter that queries the Policy Store and returns a real `PolicyDecision{compliant, confidence, citation_ids}` — the same port shape the Agent Loop already calls, so no caller code changes. See [Epics & Stories](../planning/EPICS.md) for the full planned sequence.
+[Stage 2.2](./story-2.2.md) reads what this stage writes: it replaces `services/policy.py`'s hardcoded rule set with a retrieval-backed adapter that queries the Policy Store and returns a real `PolicyDecision{compliant, confidence, citation_ids}` — the same port shape the Agent Loop already calls, so no caller code changes. See [Epics & Stories](../planning/EPICS.md) for the full planned sequence.
